@@ -21,6 +21,8 @@ class GemWriteToFile:
         if cls._instance is None:
             cls._instance = super(GemWriteToFile, cls).__new__(cls)
             cls._instance.__initialize(result_dir, debugging_enabled)
+        elif cls._instance.__result_dir != result_dir or cls._instance.__debugging_enabled != debugging_enabled: # Re-initialize if parameters differ
+            cls._instance.__initialize(result_dir, debugging_enabled)
         return cls._instance
 
     def __initialize(self, result_dir, debugging_enabled):
