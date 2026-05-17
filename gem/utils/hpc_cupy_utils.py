@@ -67,7 +67,7 @@ class HpcUtils:
 
     # Get RAW Module
     @classmethod
-    def get_raw_module(cls, module_filename_without_ext):
+    def get_raw_module_and_convert_cu2ptx(cls, module_filename_without_ext):
         # Get the path of the current script
         script_dir = os.path.dirname(os.path.realpath(__file__))
         gpu_kernels_dir = os.path.join(script_dir, "..", 'kernels')
@@ -89,6 +89,28 @@ class HpcUtils:
         raw_module = cp.RawModule(path=ptx_file_path)
 
         return raw_module
+    
+    @classmethod
+    def get_raw_module(cls, module_filename_without_ext):
+
+        # Get path of current script
+        script_dir = os.path.dirname(os.path.realpath(__file__))
+        gpu_kernels_dir = os.path.join(script_dir, "..", "kernels")
+
+        # Path to .cu file
+        kernel_file_path = os.path.join(
+            gpu_kernels_dir,
+            f"{module_filename_without_ext}.cu"
+        )
+
+        # Read CUDA source
+        with open(kernel_file_path, "r") as kernel_file:
+            module_code = kernel_file.read()
+
+        # Compile directly with CuPy
+        raw_module = cp.RawModule(code=module_code)
+
+        return raw_module    
 
     # Release the GPU memory kept by the variables which are either gone out of scope or deleted
     @classmethod
