@@ -6,7 +6,7 @@
 	  "@Paper Title	:	GPU-Empowered Mapping of Population Receptive Fields for Large-Scale fMRI Analysis"
 -->
 
-<root version="0.1.12">
+<root version="0.1.13">
   <refine_fitting enable="True" refinefit_on_gpu="True"/> <!-- Execute refine fitting on GPU if sufficient GPU memory is available -->
   
   <!-- Stimulus data -->
@@ -89,17 +89,18 @@
         <filepath>path/to/data/tests/gem_generic_test/BIDS/sub-001/ses-3n2/func/sub-001_ses-3n2_task-prf_acq-normal_run-01_bold.nii.gz</filepath>
         <filepath>path/to/data/tests/gem_generic_test/BIDS/sub-001/ses-3n2/func/sub-001_ses-3n2_task-prf_acq-normal_run-01_bold.nii.gz</filepath>
       </measured_data_filepath>
-      <results>
+      <!-- output_format: "hdf5" (default) saves parameters + full metadata as HDF5; "json" saves a flat list of per-voxel dicts as JSON -->
+      <results output_format="hdf5">
 
         <!--  directory for results  -->
         <basepath>path/to/data/tests/gem_generic_test/derivatives/prfanalyze-gem/analysis-01/sub-001/ses-3n2/</basepath>
-        
+
         <!--  Custom result filename postfix  -->
         <custom_filename_postfix>-sample</custom_filename_postfix>
-        
+
         <!--  Flag to prepend date  -->
         <prepend_date>True</prepend_date>
-        
+
       </results>
 
     </fixed_paths>

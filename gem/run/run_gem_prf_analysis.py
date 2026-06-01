@@ -50,6 +50,7 @@ from gem.data.bids_handler import GemBidsHandler
 from gem.data.gem_bids_concatenation_data_info import BidsConcatenationDataInfo
 from gem.data.gem_stimulus_file_info import StimulusFileInfo
 from gem.tools.json_file_operations import JsonMgr
+from gem.tools.result_file_writer import ResultFileWriter
 from gem.utils.gem_gpu_manager import GemGpuManager as ggm
 from gem.utils.logger import Logger
 from gem.utils.gem_h5_file_handler import H5FileManager
@@ -208,14 +209,15 @@ class GEMpRFAnalysis:
         result_filepaths_list = []
         for data_idx in range(len(measured_data_list)):
             if cfg.bids['@enable'] == "True":
-                result_file =  GemBidsHandler.inputpath2resultpath(cfg.bids, measured_data_info_list[data_idx], analysis_id=cfg.bids["results_anaylsis_id"]["#text"])                
+                result_file = GemBidsHandler.inputpath2resultpath(cfg.bids, measured_data_info_list[data_idx], analysis_id=cfg.bids["results_anaylsis_id"]["#text"], output_format=(cfg.results or {}).get('output_format', 'hdf5'))
             else:
                 file = os.path.basename(measured_data_list[data_idx])
                 filename = (file.split("."))[0]
                 filename = (str(str(datetime.date.today()) + '_') if cfg.results['prepend_date'] == "True" else '') + filename
                 result_base_path = cfg.results['basepath']                
                 custom_postfix = cfg.results['custom_filename_postfix'] if cfg.results['custom_filename_postfix'] is not None else ""
-                result_file = os.path.join(result_base_path, filename.replace("bold", "estimates")+ custom_postfix + ".json")                
+                ext = '.h5' if (cfg.results or {}).get('output_format', 'hdf5') in ('hdf5', 'h5') else '.json'
+                result_file = os.path.join(result_base_path, filename.replace("bold", "estimates") + custom_postfix + ext)
             
             # append to list
             result_filepaths_list.append(result_file)
@@ -248,7 +250,7 @@ class GEMpRFAnalysis:
             # print(input_filepaths)
             # print(data_info_dictionaries_list)
             concatenation_result_info = BidsConcatenationDataInfo.compare_and_merge_data_info_dicts(data_info_dictionaries_list)
-            concatenated_result_filename = GemBidsHandler.get_concatenated_result_filepath(cfg.bids, input_filepaths[0], concatenation_result_info)
+            concatenated_result_filename = GemBidsHandler.get_concatenated_result_filepath(cfg.bids, input_filepaths[0], concatenation_result_info, output_format=(cfg.results or {}).get('output_format', 'hdf5'))
             concatenation_data_info = BidsConcatenationDataInfo(input_filepaths, data_info_dictionaries_list, stimulus_info, concatenation_result_info, concatenated_result_filename)
             required_concatenations_info.append(concatenation_data_info)
         
@@ -580,7 +582,15 @@ class GEMpRFAnalysis:
                 # print ("Refined fitting done...")
 
             # NOTE: Write the full results of the current concatenation block to file
-            JsonMgr.write_to_file(filepath=concatenate_block_info.concatenation_result_filepath, data=json_data)   
+            ResultFileWriter.write(
+                filepath=concatenate_block_info.concatenation_result_filepath,
+                data=json_data,
+                cfg=cfg,
+                input_filepaths=concatenate_block_info.filepaths_to_be_concatenated,
+                stimulus_filepath=cfg.stimulus.get('directory', cfg.stimulus.get('filepath', '')),
+                run_type='concatenated',
+                duration_sec=time.time() - start_time,
+            )
 
             Logger.print_green_message(f"Results written to file: {concatenate_block_info.concatenation_result_filepath}", print_file_name=False)
 
@@ -674,7 +684,15 @@ class GEMpRFAnalysis:
             json_data = R2.format_in_json_format( r2_results, valid_refined_prf_points_XY, None, refined_signals_present=False)                    
             
             # write results to file
-            JsonMgr.write_to_file(filepath=result_filepaths_list[data_idx], data=json_data)
+            ResultFileWriter.write(
+                filepath=result_filepaths_list[data_idx],
+                data=json_data,
+                cfg=cfg,
+                input_filepaths=[measured_data_list[data_idx]],
+                stimulus_filepath=os.path.join(stimulus_info.stimulus_dir, stimulus_info.stimulus_filename),
+                run_type='individual',
+                duration_sec=time.time() - start_time,
+            )
 
             # information
             Logger.print_green_message(f"Results written to file: {result_filepaths_list[data_idx]}", print_file_name=False)

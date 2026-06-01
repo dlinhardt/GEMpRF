@@ -71,9 +71,10 @@
         <filepath>Y:\data\tests\gem-paper-simulated-data\analysis\04\BIDS\derivatives\prfsynth\analysis-04\sub-001\ses-3n2\func\sub-001_ses-3n2_task-prf_acq-normal_run-01_bold.nii.gz</filepath>
         <filepath>...dummy_filepath.....</filepath>
       </measured_data_filepath>              
-      <results> <!-- Results filepaths realted  -->
+      <!-- output_format: "hdf5" (default) saves parameters + full metadata as HDF5; "json" saves a flat list of per-voxel dicts as JSON -->
+      <results output_format="hdf5"> <!-- Results filepaths realted  -->
         <basepath>D:\results\fmri/generic/</basepath> <!-- Base path for results -->
-        <custom_filename_postfix>_[gem-benchmark_51x51x8]</custom_filename_postfix> <!-- Custom filename postfix -->    
+        <custom_filename_postfix>_[gem-benchmark_51x51x8]</custom_filename_postfix> <!-- Custom filename postfix -->
         <prepend_date>True</prepend_date> <!-- Flag to prepend date -->
       </results>
     </fixed_paths>
