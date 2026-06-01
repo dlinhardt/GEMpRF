@@ -224,7 +224,7 @@ class GemBidsHandler:
         return input_src_files
     
     @classmethod
-    def inputpath2resultpath(self, bids_config : json, input_file_info : tuple, analysis_id : str = None):
+    def inputpath2resultpath(self, bids_config : json, input_file_info : tuple, analysis_id : str = None, output_format : str = 'hdf5'):
         filename = os.path.basename(input_file_info[0])
         if filename.endswith('.nii.gz'):
             filename_without_extension = filename.split('_bold.nii.gz')[0]
@@ -246,7 +246,8 @@ class GemBidsHandler:
             
         base_path = os.path.join(base_path, 'derivatives', 'prfanalyze-gem', f'analysis-{analysis}', f'sub-{sub}', f'ses-{ses}')    
         ## os.makedirs(base_path, exist_ok=True)
-        filepath = os.path.join(base_path, filename_without_extension + '_estimates.json')
+        ext = '.h5' if output_format in ('hdf5', 'h5') else '.json'
+        filepath = os.path.join(base_path, filename_without_extension + '_estimates' + ext)
 
         return filepath
 
@@ -265,7 +266,7 @@ class GemBidsHandler:
         return updated_filename    
 
     @classmethod
-    def get_concatenated_result_filepath(cls, bids_config : json, filepath : str, concatenation_result_info : dict):
+    def get_concatenated_result_filepath(cls, bids_config : json, filepath : str, concatenation_result_info : dict, output_format : str = 'hdf5'):
         if filepath.endswith('.nii.gz'):
             filename_without_extension = os.path.basename(filepath).split('_bold.nii.gz')[0]
         elif filepath.endswith('.gii'):
@@ -282,6 +283,7 @@ class GemBidsHandler:
         base_path = os.path.join(base_path, 'derivatives', 'prfanalyze-gem', f'analysis-{results_anaylsis_id}', f'sub-{sub}', f'ses-{ses}')    
         # os.makedirs(base_path, exist_ok=True)
 
-        filepath = os.path.join(base_path, concatenated_result_filename + '_estimates.json')
+        ext = '.h5' if output_format in ('hdf5', 'h5') else '.json'
+        filepath = os.path.join(base_path, concatenated_result_filename + '_estimates' + ext)
 
         return filepath

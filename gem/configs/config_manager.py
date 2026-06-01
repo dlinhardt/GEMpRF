@@ -74,6 +74,8 @@ class ConfigurationWrapper:
         # results
         #cls.results = cls.config_data.get("results")
         cls.results = (cls.config_data.get("input_datasrc")).get("fixed_paths").get("results")
+        if cls.results is not None:
+            cls.results['output_format'] = cls.results.get('@output_format', 'hdf5')
 
         # PRF Model
         cls.pRF_model_details = cls.config_data.get("pRF_model")

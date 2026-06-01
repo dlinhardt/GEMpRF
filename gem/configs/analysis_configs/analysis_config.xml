@@ -5,7 +5,7 @@
     "@Contact :   siddharth.mittal@meduniwien.ac.at",
     "@License :   (C)Copyright 2024 - 2025, Medical University of Vienna"
 -->
-<root version="0.1.12">
+<root version="0.1.13">
   <!-- Path information -->
   <path_to_append>.../</path_to_append>
   <refine_fitting enable="True" refinefit_on_gpu="True"/> <!-- Execute refine fitting on GPU if sufficient GPU memory is available -->
@@ -77,7 +77,8 @@
         <!-- <filepath>/optional/example/of/more_files.nii.gz</filepath> -->
       </measured_data_filepath>              
 
-      <results>
+      <!-- output_format: "hdf5" (default) saves parameters + full metadata as HDF5; "json" saves a flat list of per-voxel dicts as JSON -->
+      <results output_format="hdf5">
         <!-- Root directory where all output files will be written -->
         <basepath>/path/to/output/analysis-folder/</basepath>
 
