@@ -29,6 +29,7 @@ from gem.utils.gem_gpu_manager import GemGpuManager as ggm
 from gem.utils.gem_write_to_file import GemWriteToFile
 from gem.utils.logger import Logger
 from gem.utils.gem_h5_file_handler import H5FileManager
+from gem.utils.run_report import RunReport
 
 # gemprf wrapper import
 from gemprf import __version__
@@ -110,13 +111,17 @@ def run_selected_program(selected_program, config_filepath):
     # copy the config file to the results folder, decide to overwrite or not the existing analysis results diretory
     if selected_program == SelectedProgram.GEMAnalysis:
         if cfg.bids['@enable'] == "True":
-            result_dir = os.path.join(cfg.bids.get("basepath"), "derivatives", "prfanalyze-gem", f'analysis-{cfg.bids["results_anaylsis_id"]["#text"]}')
+            # results_anaylsis_id is a dict when the XML sets attributes on it, a bare string otherwise
+            rai = cfg.bids["results_anaylsis_id"]
+            analysis_id = rai["#text"] if isinstance(rai, dict) else rai
+            result_dir = os.path.join(cfg.bids.get("basepath"), "derivatives", "prfanalyze-gem", f'analysis-{analysis_id}')
         else:
             result_dir = cfg.fixed_paths['results']['basepath']
         # "false" backs up the existing results dir; "true"/"skip" leave it in place
         if os.path.exists(result_dir) and cfg.overwrite_mode == "false":
             shutil.move(result_dir, f'{result_dir}_backup-{datetime.datetime.now():%Y%m%d-%H%M%S}')
         shutil.copy(config_filepath, result_dir) if os.makedirs(result_dir, exist_ok=True) is None else None
+        cfg.result_dir = result_dir
 
     # ...prf spatial points
     if spatial_points_xy is None:
@@ -145,8 +150,13 @@ def run_selected_program(selected_program, config_filepath):
     GemWriteToFile.get_instance().write_array_to_h5(prf_space.multi_dim_points_cpu, variable_path=['model', 'prf_grid'], append_to_existing_variable=False)
 
     # run the pRF analysis
-    if selected_program == SelectedProgram.GEMAnalysis:             
-        GEMpRFAnalysis.run(cfg, prf_model, prf_space)
+    if selected_program == SelectedProgram.GEMAnalysis:
+        run_type = 'concatenated' if (cfg.bids['@enable'] == "True" and cfg.bids['@run_type'].lower() == "concatenated") else 'individual'
+        report = RunReport(run_type=run_type, gemprf_version=__version__, config_filepath=config_filepath, result_dir=result_dir)
+        try:
+            GEMpRFAnalysis.run(cfg, prf_model, prf_space, report)
+        finally:
+            report.finalize()
         
 # run the main function
 def init_setup(config_filepath = None):    
