@@ -113,7 +113,8 @@ def run_selected_program(selected_program, config_filepath):
             result_dir = os.path.join(cfg.bids.get("basepath"), "derivatives", "prfanalyze-gem", f'analysis-{cfg.bids["results_anaylsis_id"]["#text"]}')
         else:
             result_dir = cfg.fixed_paths['results']['basepath']
-        if os.path.exists(result_dir) and cfg.bids["results_anaylsis_id"].get("@overwrite").lower() == "false":
+        # "false" backs up the existing results dir; "true"/"skip" leave it in place
+        if os.path.exists(result_dir) and cfg.overwrite_mode == "false":
             shutil.move(result_dir, f'{result_dir}_backup-{datetime.datetime.now():%Y%m%d-%H%M%S}')
         shutil.copy(config_filepath, result_dir) if os.makedirs(result_dir, exist_ok=True) is None else None
 

@@ -20,7 +20,11 @@
       <basepath>D:/results/gem-paper-simulated-data/analysis/11/BIDS/</basepath>
       <append_to_basepath>derivatives, prfsynth</append_to_basepath> <!-- specify if the "analysis-xx"  -->          
       <!-- <basepath>D:/results/fmri/generic/</basepath>           -->
-      <results_anaylsis_id>01</results_anaylsis_id>
+      <!-- Directory name for results.
+           overwrite: "false" = back up any existing results dir to <dir>_backup-<timestamp> before running;
+                      "true"  = write into the existing dir, overwriting colliding result files;
+                      "skip"  = leave existing results untouched and skip inputs whose result (.h5 or .json) already exists. -->
+      <results_anaylsis_id overwrite="false">01</results_anaylsis_id>
       <!-- analysis id to save the results -->
 
       <!-- 
