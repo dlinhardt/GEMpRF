@@ -53,6 +53,7 @@ from gem.tools.json_file_operations import JsonMgr
 from gem.tools.result_file_writer import ResultFileWriter
 from gem.utils.gem_gpu_manager import GemGpuManager as ggm
 from gem.utils.logger import Logger
+from gem.utils.gem_errors import TimepointMismatchError, InputFileMissingError
 from gem.utils.gem_h5_file_handler import H5FileManager
 from gem.signals.hrf_generator import spm_hrf_compat
 
@@ -313,10 +314,10 @@ class GEMpRFAnalysis:
         # process bathches
         Y_signals_cpu = Y_signals_cpu[:, None] if Y_signals_cpu.ndim == 1 else Y_signals_cpu # in case only one signal is present
 
-        # exit if number of timepoints in y-signals and stimulus do not match
-        if Y_signals_cpu.shape[0] != (stimulus.NumFrames, stimulus.NumFramesDownsampled)[stimulus.HighTemporalResolutionEnabled]:
-            Logger.print_red_message(f"Number of timepoints in measured fMRI data ({Y_signals_cpu.shape[0]}) and stimulus ({stimulus.NumFrames}) do not match for file: {measured_data_filepath}", print_file_name=False)
-            sys.exit(1)
+        # fail this analysis if number of timepoints in y-signals and stimulus do not match
+        stimulus_num_frames = (stimulus.NumFrames, stimulus.NumFramesDownsampled)[stimulus.HighTemporalResolutionEnabled]
+        if Y_signals_cpu.shape[0] != stimulus_num_frames:
+            raise TimepointMismatchError(f"Number of timepoints in measured fMRI data ({Y_signals_cpu.shape[0]}) and stimulus ({stimulus_num_frames}) do not match for file: {measured_data_filepath}")
 
         total_y_signals = Y_signals_cpu.shape[1]
         num_batches = int(cfg.measured_data["batches"])
@@ -383,7 +384,30 @@ class GEMpRFAnalysis:
 
     ##########################################################---------------------------------RUN---------------------------------################################################
     @classmethod
-    def concatenated_run(cls, cfg, prf_model, prf_space):
+    def _filter_existing_results(cls, cfg, items, get_result_path, report):
+        """Drop the items whose result already exists (overwrite_mode == "skip").
+
+        The skipped items are collected in the report instead of being printed one by one.
+        Returns the items that still have to be analysed.
+        """
+        if getattr(cfg, "overwrite_mode", "false") != "skip":
+            return items
+
+        kept = []
+        for item in items:
+            result_filepath = get_result_path(item)
+            if ResultFileWriter.result_exists(result_filepath):
+                report.add_skipped(result_filepath)
+            else:
+                kept.append(item)
+
+        if report.num_skipped:
+            Logger.print_green_message(f"Skipping {report.num_skipped} analysis(es) - results already exist (see run report for the list).", print_file_name=False)
+
+        return kept
+
+    @classmethod
+    def concatenated_run(cls, cfg, prf_model, prf_space, report):
         # cfg = GEMpRFAnalysis.load_config(config_filepath=config_filepath) # load default config
         default_gpu_id = ggm.get_instance().default_gpu_id
         refinefit_on_gpu = cfg.is_refinefit_on_gpu & cfg.refine_fitting_enabled
@@ -392,17 +416,10 @@ class GEMpRFAnalysis:
         required_concatenations_info = cls.get_concatenated_runs_data_files_info(cfg)
 
         # skip concatenations whose result already exists (in either hdf5 or json form)
-        if getattr(cfg, "overwrite_mode", "false") == "skip":
-            kept = []
-            for info in required_concatenations_info:
-                if ResultFileWriter.result_exists(info.concatenation_result_filepath):
-                    Logger.print_green_message(f"Skipping (result already exists): {info.concatenation_result_filepath}", print_file_name=False)
-                else:
-                    kept.append(info)
-            required_concatenations_info = kept
-            if len(required_concatenations_info) == 0:
-                Logger.print_green_message("All results already exist. Nothing to do.", print_file_name=False)
-                return
+        required_concatenations_info = cls._filter_existing_results(cfg, required_concatenations_info, lambda info: info.concatenation_result_filepath, report)
+        if report.num_skipped and len(required_concatenations_info) == 0:
+            Logger.print_green_message("All results already exist. Nothing to do.", print_file_name=False)
+            return
 
         if len(required_concatenations_info) == 0:
             Logger.print_red_message("No data files found. Please check the specified paths in your XML configuration file. Aborting now...", print_file_name=False)
@@ -464,159 +481,171 @@ class GEMpRFAnalysis:
                 self.task_name = task_name
 
         counter = 0
-        for concatenate_block_info in required_concatenations_info:            
+        for concatenate_block_info in required_concatenations_info:
             counter += 1
-            json_data = None   
-            # Collect Y-Signals
             start_time = time.time()
-            arr_Y_signals_cpu = []
-            num_concatenation_items = len(concatenate_block_info.filepaths_to_be_concatenated) 
-            for concat_item_idx in range(num_concatenation_items):
-                input_data_filepath = concatenate_block_info.filepaths_to_be_concatenated[concat_item_idx]
-                task_name = concatenate_block_info.input_data_info_to_be_concatenated[concat_item_idx].get("task")
-                if not os.path.exists(input_data_filepath):
-                    raise ValueError(f"Input source file does not exist: {input_data_filepath}", print_file_name=False)
+            try:
+                cls._process_concatenation_block(cfg, prf_model, prf_space, concatenate_block_info, task_specific_data_dict,
+                                                 arr_2d_location_inv_M_cpu, refinefit_on_gpu, default_gpu_id, YSignalsInfo,
+                                                 counter, len(required_concatenations_info), start_time)
+            except Exception as exc:
+                Logger.print_red_message(f"Analysis FAILED for {concatenate_block_info.concatenation_result_filepath}: {exc}", print_file_name=False)
+                report.add_failed(concatenate_block_info.concatenation_result_filepath, exc)
+                continue
 
-                Logger.print_green_message(f"Processing-{counter}/{len(required_concatenations_info)} data file: {input_data_filepath}", print_file_name=False)
-                measured_data_filepath = input_data_filepath
-                  
-                # y-signals
-                y_data = ObservedData(data_source=DataSource.measured_data)
-                Y_signals_cpu = y_data.get_y_signals(measured_data_filepath)
-                y_signals_info = YSignalsInfo(Y_signals_cpu, task_name) 
-                arr_Y_signals_cpu.append(y_signals_info)    
-                # arr_Y_signals_cpu.append((Y_signals_cpu, task_name))    
-        
-            ###################
-            # process Y-BATCHES
-            ###################               
-            # json_data = None   
-            total_y_signals = arr_Y_signals_cpu[0].Y_signals_cpu.shape[1]
-            num_batches = int(cfg.measured_data["batches"])
-            batch_size = int(total_y_signals / num_batches)
-            for current_batch_idx in range(0, total_y_signals, batch_size):    
-                # go through all datasets and compute error terms for each run
-                # arr_e_cpu = None #cp.empty((num_runs, batch_size, num_signals)) #[]
-                arr_e_list = []
-                arr_de_dtheta_full_list = []
-                Y_signals_batch_gpu_list = []
-                for concat_item_idx in range(num_concatenation_items):                                
-                    # current Y-BATCH, for current dataset
-                    Y_signals_batch_gpu = ggm.get_instance().execute_cupy_func_on_default(cp.asarray, cupy_func_args=((arr_Y_signals_cpu[concat_item_idx].Y_signals_cpu)[:, current_batch_idx: current_batch_idx + batch_size],))                                        
-                    Y_signals_batch_gpu_list.append(Y_signals_batch_gpu)            
-                    Y_signals_batch_cpu = (arr_Y_signals_cpu[concat_item_idx].Y_signals_cpu)[:, current_batch_idx: current_batch_idx + batch_size]
-                    num_Y_signals_in_batch = Y_signals_batch_cpu.shape[1] # this is just the number of Y-signals in the current batch, it is independent of the task-name
-                    current_data_task = arr_Y_signals_cpu[concat_item_idx].task_name
-                    _, e_gpu, de_dtheta_full_list = GridFit.get_error_terms(isResultOnGPU=((cfg.is_refinefit_on_gpu & cfg.refine_fitting_enabled) | (not cfg.refine_fitting_enabled)),
-                                                                                Y_signals_gpu=Y_signals_batch_gpu,
-                                                                                S_prime_cm_batches_gpu=task_specific_data_dict[current_data_task].prf_analysis.orthonormalized_S_batches,
-                                                                                dS_prime_dtheta_cm_batches_list_gpu=task_specific_data_dict[current_data_task].prf_analysis.orthonormalized_dS_dtheta_batches_list)
-                
-                    arr_e_list.append(e_gpu)
-                    arr_de_dtheta_full_list.append(de_dtheta_full_list)
-
-                # NOTE: process this batch of concatenation block
-                # ...sum up the error terms (e and de_dtheta) for all the runs
-                # ...current Y-BATCH concatenated error terms                                            
-                xp = cp if refinefit_on_gpu else np
-                ctx = cp.cuda.Device(default_gpu_id) if refinefit_on_gpu else nullcontext()
-                with ctx:                                        
-                    # ...sum up e terms
-                    arr_e = xp.stack(arr_e_list, axis=0)
-                    concatenated_e = xp.sum(arr_e, axis=0)                    
-
-                    if cfg.refine_fitting_enabled:
-                        # ...sum up de_dtheta terms
-                        arr_de_dtheta_full = xp.stack(arr_de_dtheta_full_list, axis=0) #shape = (num items to concatenate, num params, num y signals, num model signals)
-                        concatenated_de_dtheta = xp.sum(arr_de_dtheta_full, axis=0)
-
-                    best_fit_proj = xp.nanargmax(concatenated_e, axis=1)# current Y-BATCH concatenated best fit                    
-
-                #  current Y-BATCH refine fit
-                refined_matching_results_XY = None
-                coarse_pRF_estimations = None
-                if cfg.refine_fitting_enabled:
-                    refined_matching_results_XY, _ = RefineFit.get_refined_fit_results(prf_space=prf_space,
-                                                                                    num_Y_signals=num_Y_signals_in_batch,
-                                                                                    best_fit_proj=best_fit_proj,
-                                                                                    arr_2d_location_inv_M_cpu=arr_2d_location_inv_M_cpu,
-                                                                                    e_full=concatenated_e,  # send overall error terms
-                                                                                    de_dtheta_3darr=concatenated_de_dtheta)
-                else:
-                    coarse_pRF_estimations = (prf_space.multi_dim_points_cpu, prf_space.multi_dim_points_gpu)[((cfg.is_refinefit_on_gpu & cfg.refine_fitting_enabled) | (not cfg.refine_fitting_enabled))][best_fit_proj]
-                                        
-                # # # NOTE NOTE NOTE: Validate the refined results!!!!!!!!!!! STEP MISSING: because for this, we need to compute the results with the all stimuli used for different tasks, it will waste a lot of time.
-                # # coarse_pRF_estimations = prf_space.multi_dim_points_cpu[best_fit_proj_cpu]
-                # # valid_refined_prf_points_XY_batch = GEMpRFAnalysis.get_valid_refined_data(refined_matching_results_XY, 
-                # #                                                                           Y_signals_gpu=Y_signals_batch_gpu, # NOTE: here we would need to pass the list of signals for all concatenated_item
-                # #                                                                           O_gpu=O_gpu, 
-                # #                                                                           prf_model=prf_model, 
-                # #                                                                           stimulus=stimulus,  # NOTE: here we would need to pass the list of stimuli required for each concatenated_item
-                # #                                                                           coarse_e_cpu=e_cpu, 
-                # #                                                                           best_fit_proj_cpu=best_fit_proj_cpu, 
-                # #                                                                           coarse_pRF_estimations=coarse_pRF_estimations)
-
-                # Final results 
-                valid_refined_prf_points_XY_batch = (coarse_pRF_estimations, refined_matching_results_XY)[cfg.refine_fitting_enabled]
-
-                valid_refined_S_cpu_batch_list = []
-                for concat_item_idx in range(num_concatenation_items):
-                    stimulus_task_name = arr_Y_signals_cpu[concat_item_idx].task_name
-                    task_specific_stimulus = task_specific_data_dict[stimulus_task_name].stimulus
-                    valid_refined_S_cpu_batch = GEMpRFAnalysis.get_refined_signals_cpu(valid_refined_prf_points_XY_batch, prf_model, task_specific_stimulus, cfg)
-                    valid_refined_S_cpu_batch_list.append(valid_refined_S_cpu_batch)
-
-                # current Y-BATCH compute concatenated R2        
-                numerators_gpu = cp.empty((num_concatenation_items, num_Y_signals_in_batch))
-                denominators_gpu = cp.empty((num_concatenation_items, num_Y_signals_in_batch))
-                # ...compute the numerator and denominator terms for each run's dataset individually using the above computed Refinement results. 
-                # ...The O_gpu signals depend on the Stimulus so, send the correct one !!!
-                for concat_item_idx in range(num_concatenation_items):
-                    stimulus_task_name = arr_Y_signals_cpu[concat_item_idx].task_name
-                    task_specific_stimulus = task_specific_data_dict[stimulus_task_name].stimulus
-                    task_specific_O_gpu = task_specific_data_dict[stimulus_task_name].O_gpu
-                    num_gpu, den_gpu = R2.get_r2_numerator_denominator_terms(Y_signals_batch_gpu_list[concat_item_idx], 
-                                                                             task_specific_O_gpu, 
-                                                                             valid_refined_prf_points_XY_batch, 
-                                                                             valid_refined_S_cpu_batch_list[concat_item_idx])
-                    numerators_gpu[concat_item_idx] = num_gpu
-                    denominators_gpu[concat_item_idx] = den_gpu
-
-                ## ...compute overall r2 for current Y-BATCH
-                r2_numerator_term = cp.sum(numerators_gpu, axis=0)
-                r2_inverse_term = (cp.sum(denominators_gpu, axis=0)) ** (-1)
-                r2_result_batch = cp.where(r2_numerator_term>0, 1 - r2_numerator_term * r2_inverse_term, r2_numerator_term) 
-                batch_json_data = R2.format_in_json_format(r2_result_batch, valid_refined_prf_points_XY_batch, None, refined_signals_present=False)
-                if json_data is None:
-                    json_data = batch_json_data
-                else:
-                    json_data += batch_json_data
-
-                # print ("Refined fitting done...")
-
-            # NOTE: Write the full results of the current concatenation block to file
-            ResultFileWriter.write(
-                filepath=concatenate_block_info.concatenation_result_filepath,
-                data=json_data,
-                cfg=cfg,
-                input_filepaths=concatenate_block_info.filepaths_to_be_concatenated,
-                stimulus_filepath=cfg.stimulus.get('directory', cfg.stimulus.get('filepath', '')),
-                run_type='concatenated',
-                duration_sec=time.time() - start_time,
-            )
-
-            Logger.print_green_message(f"Results written to file: {concatenate_block_info.concatenation_result_filepath}", print_file_name=False)
-
-            # end time
-            end_time = time.time()
-            iteration_time = end_time - start_time
-            # iteration_times.append(iteration_time)
+            iteration_time = time.time() - start_time
+            report.add_completed(concatenate_block_info.concatenation_result_filepath, iteration_time)
             print(f"Time taken for this analysis: {iteration_time}\n")
-        
-        print
+
+        print ("All files processed...")
 
     @classmethod
-    def individual_run(cls, cfg, prf_model, prf_space):
+    def _process_concatenation_block(cls, cfg, prf_model, prf_space, concatenate_block_info, task_specific_data_dict,
+                                     arr_2d_location_inv_M_cpu, refinefit_on_gpu, default_gpu_id, YSignalsInfo,
+                                     counter, num_concatenation_blocks, start_time):
+        """Run a single concatenation block. Raises on failure; the caller records it in the run report."""
+        json_data = None
+        # Collect Y-Signals
+        arr_Y_signals_cpu = []
+        num_concatenation_items = len(concatenate_block_info.filepaths_to_be_concatenated)
+        for concat_item_idx in range(num_concatenation_items):
+            input_data_filepath = concatenate_block_info.filepaths_to_be_concatenated[concat_item_idx]
+            task_name = concatenate_block_info.input_data_info_to_be_concatenated[concat_item_idx].get("task")
+            if not os.path.exists(input_data_filepath):
+                raise InputFileMissingError(f"Input source file does not exist: {input_data_filepath}")
+
+            Logger.print_green_message(f"Processing-{counter}/{num_concatenation_blocks} data file: {input_data_filepath}", print_file_name=False)
+            measured_data_filepath = input_data_filepath
+
+            # y-signals
+            y_data = ObservedData(data_source=DataSource.measured_data)
+            Y_signals_cpu = y_data.get_y_signals(measured_data_filepath)
+            y_signals_info = YSignalsInfo(Y_signals_cpu, task_name)
+            arr_Y_signals_cpu.append(y_signals_info)
+            # arr_Y_signals_cpu.append((Y_signals_cpu, task_name))
+
+        ###################
+        # process Y-BATCHES
+        ###################               
+        # json_data = None   
+        total_y_signals = arr_Y_signals_cpu[0].Y_signals_cpu.shape[1]
+        num_batches = int(cfg.measured_data["batches"])
+        batch_size = int(total_y_signals / num_batches)
+        for current_batch_idx in range(0, total_y_signals, batch_size):    
+            # go through all datasets and compute error terms for each run
+            # arr_e_cpu = None #cp.empty((num_runs, batch_size, num_signals)) #[]
+            arr_e_list = []
+            arr_de_dtheta_full_list = []
+            Y_signals_batch_gpu_list = []
+            for concat_item_idx in range(num_concatenation_items):                                
+                # current Y-BATCH, for current dataset
+                Y_signals_batch_gpu = ggm.get_instance().execute_cupy_func_on_default(cp.asarray, cupy_func_args=((arr_Y_signals_cpu[concat_item_idx].Y_signals_cpu)[:, current_batch_idx: current_batch_idx + batch_size],))                                        
+                Y_signals_batch_gpu_list.append(Y_signals_batch_gpu)            
+                Y_signals_batch_cpu = (arr_Y_signals_cpu[concat_item_idx].Y_signals_cpu)[:, current_batch_idx: current_batch_idx + batch_size]
+                num_Y_signals_in_batch = Y_signals_batch_cpu.shape[1] # this is just the number of Y-signals in the current batch, it is independent of the task-name
+                current_data_task = arr_Y_signals_cpu[concat_item_idx].task_name
+                _, e_gpu, de_dtheta_full_list = GridFit.get_error_terms(isResultOnGPU=((cfg.is_refinefit_on_gpu & cfg.refine_fitting_enabled) | (not cfg.refine_fitting_enabled)),
+                                                                            Y_signals_gpu=Y_signals_batch_gpu,
+                                                                            S_prime_cm_batches_gpu=task_specific_data_dict[current_data_task].prf_analysis.orthonormalized_S_batches,
+                                                                            dS_prime_dtheta_cm_batches_list_gpu=task_specific_data_dict[current_data_task].prf_analysis.orthonormalized_dS_dtheta_batches_list)
+                
+                arr_e_list.append(e_gpu)
+                arr_de_dtheta_full_list.append(de_dtheta_full_list)
+
+            # NOTE: process this batch of concatenation block
+            # ...sum up the error terms (e and de_dtheta) for all the runs
+            # ...current Y-BATCH concatenated error terms                                            
+            xp = cp if refinefit_on_gpu else np
+            ctx = cp.cuda.Device(default_gpu_id) if refinefit_on_gpu else nullcontext()
+            with ctx:                                        
+                # ...sum up e terms
+                arr_e = xp.stack(arr_e_list, axis=0)
+                concatenated_e = xp.sum(arr_e, axis=0)                    
+
+                if cfg.refine_fitting_enabled:
+                    # ...sum up de_dtheta terms
+                    arr_de_dtheta_full = xp.stack(arr_de_dtheta_full_list, axis=0) #shape = (num items to concatenate, num params, num y signals, num model signals)
+                    concatenated_de_dtheta = xp.sum(arr_de_dtheta_full, axis=0)
+
+                best_fit_proj = xp.nanargmax(concatenated_e, axis=1)# current Y-BATCH concatenated best fit                    
+
+            #  current Y-BATCH refine fit
+            refined_matching_results_XY = None
+            coarse_pRF_estimations = None
+            if cfg.refine_fitting_enabled:
+                refined_matching_results_XY, _ = RefineFit.get_refined_fit_results(prf_space=prf_space,
+                                                                                num_Y_signals=num_Y_signals_in_batch,
+                                                                                best_fit_proj=best_fit_proj,
+                                                                                arr_2d_location_inv_M_cpu=arr_2d_location_inv_M_cpu,
+                                                                                e_full=concatenated_e,  # send overall error terms
+                                                                                de_dtheta_3darr=concatenated_de_dtheta)
+            else:
+                coarse_pRF_estimations = (prf_space.multi_dim_points_cpu, prf_space.multi_dim_points_gpu)[((cfg.is_refinefit_on_gpu & cfg.refine_fitting_enabled) | (not cfg.refine_fitting_enabled))][best_fit_proj]
+                                        
+            # # # NOTE NOTE NOTE: Validate the refined results!!!!!!!!!!! STEP MISSING: because for this, we need to compute the results with the all stimuli used for different tasks, it will waste a lot of time.
+            # # coarse_pRF_estimations = prf_space.multi_dim_points_cpu[best_fit_proj_cpu]
+            # # valid_refined_prf_points_XY_batch = GEMpRFAnalysis.get_valid_refined_data(refined_matching_results_XY, 
+            # #                                                                           Y_signals_gpu=Y_signals_batch_gpu, # NOTE: here we would need to pass the list of signals for all concatenated_item
+            # #                                                                           O_gpu=O_gpu, 
+            # #                                                                           prf_model=prf_model, 
+            # #                                                                           stimulus=stimulus,  # NOTE: here we would need to pass the list of stimuli required for each concatenated_item
+            # #                                                                           coarse_e_cpu=e_cpu, 
+            # #                                                                           best_fit_proj_cpu=best_fit_proj_cpu, 
+            # #                                                                           coarse_pRF_estimations=coarse_pRF_estimations)
+
+            # Final results 
+            valid_refined_prf_points_XY_batch = (coarse_pRF_estimations, refined_matching_results_XY)[cfg.refine_fitting_enabled]
+
+            valid_refined_S_cpu_batch_list = []
+            for concat_item_idx in range(num_concatenation_items):
+                stimulus_task_name = arr_Y_signals_cpu[concat_item_idx].task_name
+                task_specific_stimulus = task_specific_data_dict[stimulus_task_name].stimulus
+                valid_refined_S_cpu_batch = GEMpRFAnalysis.get_refined_signals_cpu(valid_refined_prf_points_XY_batch, prf_model, task_specific_stimulus, cfg)
+                valid_refined_S_cpu_batch_list.append(valid_refined_S_cpu_batch)
+
+            # current Y-BATCH compute concatenated R2        
+            numerators_gpu = cp.empty((num_concatenation_items, num_Y_signals_in_batch))
+            denominators_gpu = cp.empty((num_concatenation_items, num_Y_signals_in_batch))
+            # ...compute the numerator and denominator terms for each run's dataset individually using the above computed Refinement results. 
+            # ...The O_gpu signals depend on the Stimulus so, send the correct one !!!
+            for concat_item_idx in range(num_concatenation_items):
+                stimulus_task_name = arr_Y_signals_cpu[concat_item_idx].task_name
+                task_specific_stimulus = task_specific_data_dict[stimulus_task_name].stimulus
+                task_specific_O_gpu = task_specific_data_dict[stimulus_task_name].O_gpu
+                num_gpu, den_gpu = R2.get_r2_numerator_denominator_terms(Y_signals_batch_gpu_list[concat_item_idx], 
+                                                                         task_specific_O_gpu, 
+                                                                         valid_refined_prf_points_XY_batch, 
+                                                                         valid_refined_S_cpu_batch_list[concat_item_idx])
+                numerators_gpu[concat_item_idx] = num_gpu
+                denominators_gpu[concat_item_idx] = den_gpu
+
+            ## ...compute overall r2 for current Y-BATCH
+            r2_numerator_term = cp.sum(numerators_gpu, axis=0)
+            r2_inverse_term = (cp.sum(denominators_gpu, axis=0)) ** (-1)
+            r2_result_batch = cp.where(r2_numerator_term>0, 1 - r2_numerator_term * r2_inverse_term, r2_numerator_term) 
+            batch_json_data = R2.format_in_json_format(r2_result_batch, valid_refined_prf_points_XY_batch, None, refined_signals_present=False)
+            if json_data is None:
+                json_data = batch_json_data
+            else:
+                json_data += batch_json_data
+
+            # print ("Refined fitting done...")
+
+        # NOTE: Write the full results of the current concatenation block to file
+        ResultFileWriter.write(
+            filepath=concatenate_block_info.concatenation_result_filepath,
+            data=json_data,
+            cfg=cfg,
+            input_filepaths=concatenate_block_info.filepaths_to_be_concatenated,
+            stimulus_filepath=cfg.stimulus.get('directory', cfg.stimulus.get('filepath', '')),
+            run_type='concatenated',
+            duration_sec=time.time() - start_time,
+        )
+
+        Logger.print_green_message(f"Results written to file: {concatenate_block_info.concatenation_result_filepath}", print_file_name=False)
+
+    @classmethod
+    def individual_run(cls, cfg, prf_model, prf_space, report):
         # time
         start_time = time.time()
 
@@ -624,17 +653,12 @@ class GEMpRFAnalysis:
         measured_data_list, result_filepaths_list = cls.get_single_run_data_files_info(cfg)
 
         # skip inputs whose result already exists (in either hdf5 or json form)
-        if getattr(cfg, "overwrite_mode", "false") == "skip":
-            kept_data, kept_results = [], []
-            for m, r in zip(measured_data_list, result_filepaths_list):
-                if ResultFileWriter.result_exists(r):
-                    Logger.print_green_message(f"Skipping (result already exists): {r}", print_file_name=False)
-                else:
-                    kept_data.append(m); kept_results.append(r)
-            measured_data_list, result_filepaths_list = kept_data, kept_results
-            if len(measured_data_list) == 0:
-                Logger.print_green_message("All results already exist. Nothing to do.", print_file_name=False)
-                return
+        kept_pairs = cls._filter_existing_results(cfg, list(zip(measured_data_list, result_filepaths_list)), lambda pair: pair[1], report)
+        measured_data_list = [pair[0] for pair in kept_pairs]
+        result_filepaths_list = [pair[1] for pair in kept_pairs]
+        if report.num_skipped and len(measured_data_list) == 0:
+            Logger.print_green_message("All results already exist. Nothing to do.", print_file_name=False)
+            return
 
         if len(measured_data_list) == 0:
             Logger.print_red_message("No data files found. Please check the specified paths in your XML configuration file. Aborting now...", print_file_name=False)
@@ -692,43 +716,55 @@ class GEMpRFAnalysis:
         # data_idx = 0  
         # for i in range(10):
         for data_idx in range(len(measured_data_list)):
+            measured_data_filepath = measured_data_list[data_idx]
+
             # check if input file exists
-            if not os.path.exists(measured_data_list[data_idx]):
-                Logger.print_red_message(f"Input source file does not exist: {measured_data_list[data_idx]}", print_file_name=False)
+            if not os.path.exists(measured_data_filepath):
+                exc = InputFileMissingError(f"Input source file does not exist: {measured_data_filepath}")
+                Logger.print_red_message(str(exc), print_file_name=False)
+                report.add_failed(measured_data_filepath, exc)
+                file_processed_counter += 1
                 continue
 
             start_time = time.time()
-            Logger.print_green_message(f"Processing file ({file_processed_counter}/{len(measured_data_list)}): {measured_data_list[data_idx]}", print_file_name=False)
-            valid_refined_prf_points_XY, r2_results, valid_refined_S_cpu = GEMpRFAnalysis.get_pRF_estimations(cfg, O_gpu, prf_space, prf_model, stimulus, prf_analysis, arr_2d_location_inv_M_cpu, measured_data_list[data_idx])
-            # profiler.disable()
-            # stats = pstats.Stats(profiler, stream=profile_stream)
-            # stats.strip_dirs().sort_stats("cumulative").print_stats(20)  # Top 20 most time-consuming calls
-            # print(profile_stream.getvalue())
+            Logger.print_green_message(f"Processing file ({file_processed_counter}/{len(measured_data_list)}): {measured_data_filepath}", print_file_name=False)
+            file_processed_counter += 1
+
+            try:
+                valid_refined_prf_points_XY, r2_results, valid_refined_S_cpu = GEMpRFAnalysis.get_pRF_estimations(cfg, O_gpu, prf_space, prf_model, stimulus, prf_analysis, arr_2d_location_inv_M_cpu, measured_data_filepath)
+                # profiler.disable()
+                # stats = pstats.Stats(profiler, stream=profile_stream)
+                # stats.strip_dirs().sort_stats("cumulative").print_stats(20)  # Top 20 most time-consuming calls
+                # print(profile_stream.getvalue())
 
 
-            # format results to JSON                
-            # json_data = R2.format_in_json_format( r2_results, valid_refined_prf_points_XY, valid_refined_S_cpu)   # NOTE: use this line if you want to print the refined signals in the JSON file
-            json_data = R2.format_in_json_format( r2_results, valid_refined_prf_points_XY, None, refined_signals_present=False)                    
-            
-            # write results to file
-            ResultFileWriter.write(
-                filepath=result_filepaths_list[data_idx],
-                data=json_data,
-                cfg=cfg,
-                input_filepaths=[measured_data_list[data_idx]],
-                stimulus_filepath=os.path.join(stimulus_info.stimulus_dir, stimulus_info.stimulus_filename),
-                run_type='individual',
-                duration_sec=time.time() - start_time,
-            )
+                # format results to JSON
+                # json_data = R2.format_in_json_format( r2_results, valid_refined_prf_points_XY, valid_refined_S_cpu)   # NOTE: use this line if you want to print the refined signals in the JSON file
+                json_data = R2.format_in_json_format( r2_results, valid_refined_prf_points_XY, None, refined_signals_present=False)
+
+                # write results to file
+                ResultFileWriter.write(
+                    filepath=result_filepaths_list[data_idx],
+                    data=json_data,
+                    cfg=cfg,
+                    input_filepaths=[measured_data_filepath],
+                    stimulus_filepath=os.path.join(stimulus_info.stimulus_dir, stimulus_info.stimulus_filename),
+                    run_type='individual',
+                    duration_sec=time.time() - start_time,
+                )
+            except Exception as exc:
+                Logger.print_red_message(f"Analysis FAILED for {measured_data_filepath}: {exc}", print_file_name=False)
+                report.add_failed(measured_data_filepath, exc)
+                continue
 
             # information
             Logger.print_green_message(f"Results written to file: {result_filepaths_list[data_idx]}", print_file_name=False)
-            data_src.append(measured_data_list[data_idx])  
-            file_processed_counter += 1
+            data_src.append(measured_data_filepath)
 
             # end time
             end_time = time.time()
             iteration_time = end_time - start_time
+            report.add_completed(measured_data_filepath, iteration_time)
             # iteration_times.append(iteration_time)
             print(f"Time taken for this analysis: {iteration_time}\n")
 
@@ -742,12 +778,12 @@ class GEMpRFAnalysis:
       
 
     @classmethod
-    def run(cls, cfg, prf_model, prf_space):
+    def run(cls, cfg, prf_model, prf_space, report):
         # Run the analysis (Concatenation or Individual Run)
-        if cfg.bids['@enable'] == "True" and cfg.bids['@run_type'].lower() == "concatenated":                
-            GEMpRFAnalysis.concatenated_run(cfg, prf_model, prf_space)
+        if cfg.bids['@enable'] == "True" and cfg.bids['@run_type'].lower() == "concatenated":
+            GEMpRFAnalysis.concatenated_run(cfg, prf_model, prf_space, report)
         else:
-            GEMpRFAnalysis.individual_run(cfg, prf_model, prf_space)        
+            GEMpRFAnalysis.individual_run(cfg, prf_model, prf_space, report)
 
         return 0
 
