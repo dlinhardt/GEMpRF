@@ -5,7 +5,7 @@
     "@Contact :   siddharth.mittal@meduniwien.ac.at",
     "@License :   (C)Copyright 2024 - 2025, Medical University of Vienna"
 -->
-<root version="0.1.13">
+<root version="0.1.14">
   <!-- Path information -->
   <path_to_append>.../</path_to_append>
   <refine_fitting enable="True" refinefit_on_gpu="True"/> <!-- Execute refine fitting on GPU if sufficient GPU memory is available -->
@@ -29,7 +29,10 @@
       <basepath>/ceph/mri.meduniwien.ac.at/projects/physics/fmri/data/stimsim24/</basepath>
       <append_to_basepath>derivatives, fmriprep</append_to_basepath>
       
-      <!-- Directory name for results; backups created with timestamp if overwrite="True" -->
+      <!-- Directory name for results.
+           overwrite: "false" = back up any existing results dir to <dir>_backup-<timestamp> before running;
+                      "true"  = write into the existing dir, overwriting colliding result files;
+                      "skip"  = leave existing results untouched and skip inputs whose result (.h5 or .json) already exists. -->
       <results_anaylsis_id overwrite="False">GEMpRF</results_anaylsis_id>
             
       <!-- 

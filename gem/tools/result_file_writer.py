@@ -7,6 +7,12 @@ from gem.tools.json_file_operations import JsonMgr
 
 class ResultFileWriter:
 
+    @staticmethod
+    def result_exists(filepath):
+        """True if a result already exists at this path in EITHER hdf5 or json form."""
+        base = os.path.splitext(filepath)[0]
+        return os.path.exists(base + '.h5') or os.path.exists(base + '.json')
+
     @classmethod
     def write(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec):
         fmt = (cfg.results or {}).get('output_format', 'hdf5')

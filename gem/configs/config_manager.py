@@ -77,6 +77,12 @@ class ConfigurationWrapper:
         if cls.results is not None:
             cls.results['output_format'] = cls.results.get('@output_format', 'hdf5')
 
+        # ...overwrite/skip mode for existing results ("true" | "false" | "skip")
+        # results_anaylsis_id may be a dict (has attributes) or a bare string (no attributes)
+        rai = cls.bids.get("results_anaylsis_id") if cls.bids else None
+        overwrite_attr = rai.get("@overwrite") if isinstance(rai, dict) else None
+        cls.overwrite_mode = (overwrite_attr or "false").lower()
+
         # PRF Model
         cls.pRF_model_details = cls.config_data.get("pRF_model")
 

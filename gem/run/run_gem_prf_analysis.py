@@ -391,6 +391,19 @@ class GEMpRFAnalysis:
         # data info
         required_concatenations_info = cls.get_concatenated_runs_data_files_info(cfg)
 
+        # skip concatenations whose result already exists (in either hdf5 or json form)
+        if getattr(cfg, "overwrite_mode", "false") == "skip":
+            kept = []
+            for info in required_concatenations_info:
+                if ResultFileWriter.result_exists(info.concatenation_result_filepath):
+                    Logger.print_green_message(f"Skipping (result already exists): {info.concatenation_result_filepath}", print_file_name=False)
+                else:
+                    kept.append(info)
+            required_concatenations_info = kept
+            if len(required_concatenations_info) == 0:
+                Logger.print_green_message("All results already exist. Nothing to do.", print_file_name=False)
+                return
+
         if len(required_concatenations_info) == 0:
             Logger.print_red_message("No data files found. Please check the specified paths in your XML configuration file. Aborting now...", print_file_name=False)
             return
@@ -609,6 +622,20 @@ class GEMpRFAnalysis:
 
         # data info
         measured_data_list, result_filepaths_list = cls.get_single_run_data_files_info(cfg)
+
+        # skip inputs whose result already exists (in either hdf5 or json form)
+        if getattr(cfg, "overwrite_mode", "false") == "skip":
+            kept_data, kept_results = [], []
+            for m, r in zip(measured_data_list, result_filepaths_list):
+                if ResultFileWriter.result_exists(r):
+                    Logger.print_green_message(f"Skipping (result already exists): {r}", print_file_name=False)
+                else:
+                    kept_data.append(m); kept_results.append(r)
+            measured_data_list, result_filepaths_list = kept_data, kept_results
+            if len(measured_data_list) == 0:
+                Logger.print_green_message("All results already exist. Nothing to do.", print_file_name=False)
+                return
+
         if len(measured_data_list) == 0:
             Logger.print_red_message("No data files found. Please check the specified paths in your XML configuration file. Aborting now...", print_file_name=False)
             return
