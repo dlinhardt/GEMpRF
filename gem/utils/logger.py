@@ -12,8 +12,21 @@
 import inspect
 import base64
 class Logger:
+    # Set once from cfg.write_debug_info; also read from the M-inverse background thread.
+    timing_enabled = False
+
     @classmethod
-    def print_red_message(cls, message, print_file_name=True):        
+    def enable_timing(cls, enabled):
+        cls.timing_enabled = bool(enabled)
+
+    @classmethod
+    def print_timing_message(cls, message):
+        """Print a [TIMING] line, but only when timing instrumentation is enabled."""
+        if cls.timing_enabled:
+            print(f"\033[96m[TIMING] {message}\033[0m", flush=True)
+
+    @classmethod
+    def print_red_message(cls, message, print_file_name=True):
         print(f"\033[91m{message}\033[0m")
         if (print_file_name):
             frame = inspect.currentframe().f_back

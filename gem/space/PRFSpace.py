@@ -12,14 +12,16 @@ Created on Mon Feb 19 16:08:11 2024
 """
 
 import itertools
+import time
 import numpy as np
 import cupy as cp
 # from sklearn.neighbors import KDTree
 from numba_kdtree import KDTree
 from numba import njit
 from typing import Callable
-from joblib import Parallel, delayed, parallel_backend
+from joblib import Parallel, delayed, parallel_backend, effective_n_jobs
 from gem.utils.gem_gpu_manager import GemGpuManager as ggm
+from gem.utils.logger import Logger
 
 #################################---------------------------------NUMBA Compatible Functions---------------------------------#################################
 @njit(cache=True, nogil=True)
@@ -104,118 +106,151 @@ def multidim2flatIdx(point : list, shape : list)->int:
     return flat_index
 
 
-def compute_multidim_points_neighbours_multithreaded(all_multi_dim_points_arr_cpu: np.ndarray, num_spatial_dimensions: int, kdtree: KDTree, points_xy: np.ndarray, 
-                                             num_total_dimensions: int, num_extra_dimensions: int, extra_dimensions: list, num_neighbors: int = 9, 
-                                             validated_multidim_indices: np.ndarray = None, n_jobs: int = -1):
+def compute_multidim_points_neighbours_multithreaded(all_multi_dim_points_arr_cpu: np.ndarray, num_spatial_dimensions: int, all_neighbours_indices_xy: np.ndarray, points_xy: np.ndarray,
+                                             num_total_dimensions: int, num_extra_dimensions: int, extra_dimensions: list, num_neighbors: int = 9,
+                                             validated_multidim_indices: np.ndarray = None, validated_mask: np.ndarray = None, n_jobs: int = -1):
     """
     Computes the multidimensional points neighbours (in terms of indices and Visual Field values) using multiprocessing.
-    
+
+    NOTE: `validated_multidim_indices` and `validated_mask` carry the same information but serve
+    two different roles and are both required. The index array selects WHICH points get a
+    neighbour list (fixing the output length and its alignment with `multi_dim_points_cpu`);
+    the mask filters candidate neighbours WITHIN each list.
+
+    NOTE: the work is dispatched in chunks rather than one task per point. Each point needs only
+    ~100us of kernel time, so a task per point spends most of its life in joblib dispatch.
+
     Returns:
         list: A list of multidimensional points neighbours.
     """
-    
-    # Wrapper to perform the neighbor computation for a single point
-    def process_single_point(multi_dim_point):        
-        multi_dim_neighbours_indices, multi_dim_neighbours_values = get_single_point_neighbours_Numba(multi_dim_point, num_spatial_dimensions, kdtree, points_xy, num_total_dimensions, num_extra_dimensions, extra_dimensions, num_neighbors, validated_multidim_indices)
-        return multi_dim_neighbours_indices, multi_dim_neighbours_values
-    
-    # Use threading backend because our "get_single_point_neighbours_Numba()"  uses @njit(nogil=True) decorator
+    validated_points = all_multi_dim_points_arr_cpu[validated_multidim_indices]
+
+    # Every replication of an xy point shares its xy neighbours, so the KD-tree was queried once per
+    # unique xy point; recover which row of that result each multi-dimensional point should read.
+    # Holds for any number of extra dimensions: flat = xy_idx * prod(extra dims) + extra_dim_flat,
+    # with extra_dim_flat < prod(extra dims).
+    product_shape_extra_dimensions = 1
+    for dim in extra_dimensions:
+        product_shape_extra_dimensions *= len(dim)
+    xy_row_ids = np.asarray(validated_multidim_indices, dtype=np.int64) // product_shape_extra_dimensions
+
+    num_workers = effective_n_jobs(n_jobs)
+    num_chunks = max(1, min(len(validated_points), num_workers * 4))
+    chunk_slices = np.array_split(np.arange(len(validated_points)), num_chunks)
+
+    # Wrapper to perform the neighbor computation for a chunk of points
+    def process_chunk(chunk):
+        return get_points_neighbours_chunk_Numba(validated_points[chunk], xy_row_ids[chunk], num_spatial_dimensions, all_neighbours_indices_xy, points_xy, num_total_dimensions, num_extra_dimensions, extra_dimensions, num_neighbors, validated_mask)
+
+    # Use threading backend because our "get_points_neighbours_chunk_Numba()"  uses @njit(nogil=True) decorator
     with parallel_backend('threading', n_jobs=n_jobs):
-        results = Parallel()(delayed(process_single_point)(multi_dim_point) for multi_dim_point in all_multi_dim_points_arr_cpu[validated_multidim_indices])
-    
-    # Unpacking the results
-    multi_dim_points_neighbours_flat_indices_list, multi_dim_points_neighbours_vf_values_list = zip(*results)
-    
-    return list(multi_dim_points_neighbours_flat_indices_list), list(multi_dim_points_neighbours_vf_values_list)
+        results = Parallel()(delayed(process_chunk)(chunk) for chunk in chunk_slices)
+
+    # Unpacking the results; chunks come back in dispatch order, so flattening restores point order
+    multi_dim_points_neighbours_flat_indices_list = [arr for chunk_indices, _ in results for arr in chunk_indices]
+    multi_dim_points_neighbours_vf_values_list = [arr for _, chunk_values in results for arr in chunk_values]
+
+    return multi_dim_points_neighbours_flat_indices_list, multi_dim_points_neighbours_vf_values_list
 
 
 @njit(nogil=True)
-# # def get_single_point_neighbours_Numba(multi_dim_point: np.ndarray, num_spatial_dimensions: int, kdtree: KDTree, points_xy: np.ndarray, num_total_dimensions: int, num_extra_dimensions: int, num_neighbors: int):
-def get_single_point_neighbours_Numba(multi_dim_point: np.ndarray, num_spatial_dimensions: int, kdtree: KDTree, points_xy: np.ndarray, num_total_dimensions: int, num_extra_dimensions: int, extra_dimensions: list, num_neighbors: int, validated_multidim_indices : np.ndarray):
+def get_points_neighbours_chunk_Numba(chunk_multi_dim_points: np.ndarray, chunk_xy_row_ids: np.ndarray, num_spatial_dimensions: int, all_neighbours_indices_xy: np.ndarray, points_xy: np.ndarray, num_total_dimensions: int, num_extra_dimensions: int, extra_dimensions: list, num_neighbors: int, validated_mask : np.ndarray):
     """
-    Get neighbors of a single multi-dimensional point.
+    Get neighbors of a chunk of multi-dimensional points.
 
     Args:
-        multi_dim_point (ndarray): The multi-dimensional point for which to find neighbors.
+        chunk_multi_dim_points (ndarray): The multi-dimensional points for which to find neighbors.
+        chunk_xy_row_ids (ndarray): For each point, the row of `all_neighbours_indices_xy` holding
+            its xy neighbours. The xy neighbours depend only on the point's xy coordinates, so they
+            are looked up here rather than re-queried once per replication of the same xy point.
+        all_neighbours_indices_xy (ndarray): (len(points_xy), num_neighbors) KD-tree query result,
+            computed once by the caller over the unique xy points.
         num_neighbors (int): The number of neighbors to find.
+        validated_mask (ndarray): Boolean mask over the FULL multi-dimensional grid; a candidate
+            neighbour is kept only where the mask is True. All-True when the caller does not
+            validate. NOTE: `x in ndarray` is an O(N) linear scan in numba, so a mask is used
+            here rather than an array of validated indices.
 
     Returns:
-        ndarray: An array of shape (num_neighbors, num_total_dimensions) representing the neighbors of the multi-dimensional point.
+        tuple: two lists, holding per point the flat indices and the Visual Field values of its
+        neighbours. Both are ragged: points near an edge keep fewer neighbours.
     """
-    xy_point = multi_dim_point[:num_spatial_dimensions]
-    # # distances, neighbours_indices_xy = kdtree.query([xy_point], k=num_neighbors) # NOTE: orginal KDTree
-    distances, neighbours_indices_xy, _ = kdtree.query([xy_point], k=num_neighbors) # NOTE: Numba compatible KDTree
-    neighbours_indices_xy = neighbours_indices_xy[0]
-    neighbours_xy = points_xy[neighbours_indices_xy]
-    additional_dimensions = multi_dim_point[num_spatial_dimensions:]
-    
-    
+    chunk_neighbours_flat_indices = []
+    chunk_neighbours_values = []
 
-    # gather the values and indices of the extra dimensions
-    shape_extra_dimensions = [len(dim) for dim in extra_dimensions]
-    extra_dimensions_neighbours = []
-    extra_dimensions_neighbours_indices = []
-    
+    for point_idx in range(len(chunk_multi_dim_points)):
+        multi_dim_point = chunk_multi_dim_points[point_idx]
+        neighbours_indices_xy = all_neighbours_indices_xy[chunk_xy_row_ids[point_idx]]
+        neighbours_xy = points_xy[neighbours_indices_xy]
+        additional_dimensions = multi_dim_point[num_spatial_dimensions:]
 
-    for dim_idx in range(num_extra_dimensions):
-        dim_value = additional_dimensions[dim_idx]         
-        dim_value_idx = np.argmin(np.abs(extra_dimensions[dim_idx] - dim_value)) 
-        dim_neighbours_indices = np.arange(max(0, dim_value_idx - 1), min(len(extra_dimensions[dim_idx]), dim_value_idx + 2)) # NOTE: Earlier I used range() instead of np.arange()......Line below
-        # # # # dim_neighbours_indices = np.array(np.arange(max(0, dim_value_idx - 1), min(len(extra_dimensions[dim_idx]), dim_value_idx + 2))) # NOTE: Earlier I used range() instead of np.arange()
-        dim_neighbours = (extra_dimensions[dim_idx])[dim_neighbours_indices]
-        extra_dimensions_neighbours_indices.append(dim_neighbours_indices) # reqired to get error gradients neighbours
-        extra_dimensions_neighbours.append(dim_neighbours) # required to compute M-matrix    
+        # gather the values and indices of the extra dimensions
+        shape_extra_dimensions = [len(dim) for dim in extra_dimensions]
+        extra_dimensions_neighbours = []
+        extra_dimensions_neighbours_indices = []
 
-    # convert flat indices for 2D points to flat indices for our multi-dimensional points (to generate multi-dimensional points, we replicate the 2D points in all possible combinations of extra dimensions)
-    # NOTE: Do this in the caller function ONLY once
-    product_shape_extra_dimensions = 1
-    for dim in shape_extra_dimensions:
-        product_shape_extra_dimensions *= dim
-    
-    # neighbours_indices_multi_dim_points = neighbours_indices_xy * np.prod(shape_extra_dimensions)
-    neighbours_indices_multi_dim_points = neighbours_indices_xy * product_shape_extra_dimensions # NOTE: before Numba compatible ->> neighbours_indices_xy * np.prod(shape_extra_dimensions)
+        for dim_idx in range(num_extra_dimensions):
+            dim_value = additional_dimensions[dim_idx]
+            dim_value_idx = np.argmin(np.abs(extra_dimensions[dim_idx] - dim_value))
+            dim_neighbours_indices = np.arange(max(0, dim_value_idx - 1), min(len(extra_dimensions[dim_idx]), dim_value_idx + 2)) # NOTE: Earlier I used range() instead of np.arange()......Line below
+            # # # # dim_neighbours_indices = np.array(np.arange(max(0, dim_value_idx - 1), min(len(extra_dimensions[dim_idx]), dim_value_idx + 2))) # NOTE: Earlier I used range() instead of np.arange()
+            dim_neighbours = (extra_dimensions[dim_idx])[dim_neighbours_indices]
+            extra_dimensions_neighbours_indices.append(dim_neighbours_indices) # reqired to get error gradients neighbours
+            extra_dimensions_neighbours.append(dim_neighbours) # required to compute M-matrix
 
-    # generate all combinations of extra dimension neighbours
-    num_neighbours_per_extra_dimension = [len(extra_dimensions_neighbours[dim_idx]) for dim_idx in range(num_extra_dimensions)]
-    product_num_neighbours_per_extra_dimension = 1
-    for dim in num_neighbours_per_extra_dimension:
-        product_num_neighbours_per_extra_dimension *= dim
-    total_neighbours = num_neighbors * product_num_neighbours_per_extra_dimension ##np.prod(num_neighbours_per_extra_dimension)
-    
-    current_point_neighbours_values = np.zeros((total_neighbours, num_total_dimensions))
-    # # # current_point_neighbours_indices = np.zeros((total_neighbours, self.num_total_dimensions -1), dtype=int) # "-1" because the first column is for XY indices, which are already flattened
-    
-    current_point_neighbours_flat_indices = np.zeros((total_neighbours, 1), dtype=np.int64) # NOTE: before Numba compatible ->> np.zeros((total_neighbours, 1), dtype=int)
-    
-    counter = 0
-    for xy_idx in range(len(neighbours_xy)):        
-        for extra_dimensions_info in zip(combination_generator_jit(extra_dimensions_neighbours_indices), combination_generator_jit(extra_dimensions_neighbours)):
-        # # # # # # for dim_combination in itertools.product(*extra_dimensions_neighbours): ### NOTE: this is not NUMBA compatible
-            
-            # NOTE: neighbours indices                
-            xy_flat_idx = neighbours_indices_xy[xy_idx]
-            multi_dim_flat_idx = neighbours_indices_multi_dim_points[xy_idx] 
-            extra_dim_coordinates = extra_dimensions_info[0]
-            extra_dim_flat = multidim2flatIdx(point=list(extra_dim_coordinates), shape=list(shape_extra_dimensions)) # NOTE: This needs to be CORRECTED. Use shape=shape_extra_dimensions
-            
-            # current_point_neighbours_flat_indices[counter] = multi_dim_flat_idx + extra_dim_flat #* len(points_xy) # NOTE: original
-            multi_dim_flat_idx = multi_dim_flat_idx + extra_dim_flat #* len(points_xy) # add extra-dimensions offset
+        # convert flat indices for 2D points to flat indices for our multi-dimensional points (to generate multi-dimensional points, we replicate the 2D points in all possible combinations of extra dimensions)
+        product_shape_extra_dimensions = 1
+        for dim in shape_extra_dimensions:
+            product_shape_extra_dimensions *= dim
 
-            # keep the index and neighburs values only if the multi-dimensional point is validated
-            if validated_multidim_indices is not None: 
-                if int(multi_dim_flat_idx) not in validated_multidim_indices:
+        # neighbours_indices_multi_dim_points = neighbours_indices_xy * np.prod(shape_extra_dimensions)
+        neighbours_indices_multi_dim_points = neighbours_indices_xy * product_shape_extra_dimensions # NOTE: before Numba compatible ->> neighbours_indices_xy * np.prod(shape_extra_dimensions)
+
+        # generate all combinations of extra dimension neighbours
+        num_neighbours_per_extra_dimension = [len(extra_dimensions_neighbours[dim_idx]) for dim_idx in range(num_extra_dimensions)]
+        product_num_neighbours_per_extra_dimension = 1
+        for dim in num_neighbours_per_extra_dimension:
+            product_num_neighbours_per_extra_dimension *= dim
+        total_neighbours = num_neighbors * product_num_neighbours_per_extra_dimension ##np.prod(num_neighbours_per_extra_dimension)
+
+        current_point_neighbours_values = np.zeros((total_neighbours, num_total_dimensions))
+        current_point_neighbours_flat_indices = np.zeros((total_neighbours, 1), dtype=np.int64) # NOTE: before Numba compatible ->> np.zeros((total_neighbours, 1), dtype=int)
+
+        # NOTE: both combinations are invariant in xy_idx, so build them once instead of per xy neighbour
+        extra_dim_coordinates_combinations = combination_generator_jit(extra_dimensions_neighbours_indices)
+        extra_dim_values_combinations = combination_generator_jit(extra_dimensions_neighbours)
+
+        counter = 0
+        for xy_idx in range(len(neighbours_xy)):
+            for combination_idx in range(len(extra_dim_coordinates_combinations)):
+            # # # # # # for dim_combination in itertools.product(*extra_dimensions_neighbours): ### NOTE: this is not NUMBA compatible
+
+                # NOTE: neighbours indices
+                multi_dim_flat_idx = neighbours_indices_multi_dim_points[xy_idx]
+                extra_dim_coordinates = extra_dim_coordinates_combinations[combination_idx]
+                extra_dim_flat = multidim2flatIdx(point=list(extra_dim_coordinates), shape=list(shape_extra_dimensions)) # NOTE: This needs to be CORRECTED. Use shape=shape_extra_dimensions
+
+                # current_point_neighbours_flat_indices[counter] = multi_dim_flat_idx + extra_dim_flat #* len(points_xy) # NOTE: original
+                multi_dim_flat_idx = multi_dim_flat_idx + extra_dim_flat #* len(points_xy) # add extra-dimensions offset
+
+                # keep the index and neighburs values only if the multi-dimensional point is validated
+                if not validated_mask[int(multi_dim_flat_idx)]:
                     continue
-            current_point_neighbours_flat_indices[counter] = multi_dim_flat_idx
-        
-            # NOTE: neighbours values     
-            extra_dim_values = extra_dimensions_info[1]           
-            current_point_neighbours_values[counter, :num_spatial_dimensions] = neighbours_xy[xy_idx]
-            current_point_neighbours_values[counter, num_spatial_dimensions:] = extra_dim_values
+                current_point_neighbours_flat_indices[counter] = multi_dim_flat_idx
 
-            # update counter                           
-            counter += 1
+                # NOTE: neighbours values
+                extra_dim_values = extra_dim_values_combinations[combination_idx]
+                current_point_neighbours_values[counter, :num_spatial_dimensions] = neighbours_xy[xy_idx]
+                current_point_neighbours_values[counter, num_spatial_dimensions:] = extra_dim_values
 
-    return current_point_neighbours_flat_indices[: counter, :], current_point_neighbours_values[: counter, :] # keeping only the filled values (i.e. valid neighbours)
+                # update counter
+                counter += 1
+
+        # keeping only the filled values (i.e. valid neighbours)
+        chunk_neighbours_flat_indices.append(current_point_neighbours_flat_indices[: counter, :])
+        chunk_neighbours_values.append(current_point_neighbours_values[: counter, :])
+
+    return chunk_neighbours_flat_indices, chunk_neighbours_values
 
 
 
@@ -395,17 +430,35 @@ class PRFSpace:
         if self.__validated_multidim_indices is None:
             self.__validated_multidim_indices = np.arange(len(self.__all_multi_dim_points_arr_cpu))
 
+        # Boolean mask over the full grid, for the O(1) membership test inside the numba kernel.
+        # All-True when the caller did not validate (indices are then a full arange).
+        validated_mask = np.zeros(len(self.__all_multi_dim_points_arr_cpu), dtype=np.bool_)
+        validated_mask[self.__validated_multidim_indices] = True
+
+        num_neighbors = 9
+        _num_validated = len(self.__validated_multidim_indices)
+
+        # The xy neighbours of a multi-dimensional point depend only on its xy coordinates, and every
+        # xy point is replicated across all combinations of the extra dimensions. So query the tree
+        # once per unique xy point rather than once per replication.
+        _t0 = time.time()
+        _, all_neighbours_indices_xy, _ = self.kdtree.query(self.points_xy, k=num_neighbors)
+        Logger.print_timing_message(f"kdtree.query alone ({len(self.points_xy)} xy points, k={num_neighbors}): {time.time() - _t0:.2f}s")
+
+        _t_neighbours_start = time.time()
         # Call the NUMBA compatible function to compute the multidimensional points neighbours
         self.__multi_dim_points_neighbours_flat_indices_list, self.__multi_dim_points_neighbours_vf_values_list = compute_multidim_points_neighbours_multithreaded(
-            self.__all_multi_dim_points_arr_cpu, 
-            self.num_spatial_dimensions, 
-            self.kdtree, 
-            self.points_xy, 
-            self.num_total_dimensions, 
-            self.num_extra_dimensions, 
-            list(self.extra_dimensions), 
-            num_neighbors=9, 
-            validated_multidim_indices = self.__validated_multidim_indices)
+            self.__all_multi_dim_points_arr_cpu,
+            self.num_spatial_dimensions,
+            np.ascontiguousarray(all_neighbours_indices_xy),
+            self.points_xy,
+            self.num_total_dimensions,
+            self.num_extra_dimensions,
+            list(self.extra_dimensions),
+            num_neighbors=num_neighbors,
+            validated_multidim_indices = self.__validated_multidim_indices,
+            validated_mask = validated_mask)
+        Logger.print_timing_message(f"neighbour search total ({_num_validated} validated points, k={num_neighbors}): {time.time() - _t_neighbours_start:.2f}s")
 
         return self.__multi_dim_points_neighbours_flat_indices_list, self.__multi_dim_points_neighbours_vf_values_list
 
