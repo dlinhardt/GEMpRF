@@ -152,10 +152,19 @@ class GEMpRFAnalysis:
         return additional_dimensions
 
     @classmethod
-    def execute_Grids2MpInv_NewMethod(cls, prf_space : PRFSpace, result_queue):    
-        prf_space.compute_multidim_points_neighbours()        
+    def execute_Grids2MpInv_NewMethod(cls, prf_space : PRFSpace, result_queue):
+        # neighbour search (the kdtree.query / filter-loop split is timed inside PRFSpace)
+        _t_neigh_start = time.time()
+        prf_space.compute_multidim_points_neighbours()
+        _num_points = len(prf_space.multi_dim_points_cpu)
+        Logger.print_timing_message(f"compute_multidim_points_neighbours ({_num_points} points): {datetime.timedelta(seconds=time.time() - _t_neigh_start)}")
+
+        # pinv loop over all grid points
+        _t_pinv_start = time.time()
         arr_2d_location_inv_M = CoefficientMatix.Wrapper_Grids2MpInv_numba(prf_space.multi_dim_points_cpu, prf_space.multi_dim_points_vf_neighbours)
-        result_queue.put(arr_2d_location_inv_M) 
+        Logger.print_timing_message(f"Wrapper_Grids2MpInv_numba pinv loop ({_num_points} points): {datetime.timedelta(seconds=time.time() - _t_pinv_start)}")
+
+        result_queue.put(arr_2d_location_inv_M)
 
     @classmethod
     def get_selected_prf_model(cls, cfg):
@@ -429,9 +438,10 @@ class GEMpRFAnalysis:
         arr_2d_location_inv_M_cpu = None
 
         # M-Matrix
-        result_queue = queue.Queue()    
+        result_queue = queue.Queue()
         MpInv_thread = threading.Thread(target=cls.execute_Grids2MpInv_NewMethod, args=(prf_space, result_queue))
         MpInv_thread.start()
+        mpinv_thread_start_time = datetime.datetime.now()
 
         # dictionary to hold all the stimulus-task specific data
         task_specific_data_dict = {}
@@ -470,9 +480,11 @@ class GEMpRFAnalysis:
             
         # get M-inverse matrix
         if arr_2d_location_inv_M_cpu is None:
+            join_start_time = datetime.datetime.now()
             MpInv_thread.join()
             if not result_queue.empty():
-                arr_2d_location_inv_M_cpu = result_queue.get()     
+                arr_2d_location_inv_M_cpu = result_queue.get()
+            Logger.print_timing_message(f"M-inverse thread: {datetime.datetime.now() - mpinv_thread_start_time} total, of which {datetime.datetime.now() - join_start_time} spent waiting after the GPU work")
 
         # NOTE: Process each Concatenation Block
         class YSignalsInfo:
@@ -675,9 +687,10 @@ class GEMpRFAnalysis:
 
         # M-Matrix
         if cfg.refine_fitting_enabled:
-            result_queue = queue.Queue()    
+            result_queue = queue.Queue()
             MpInv_thread = threading.Thread(target=cls.execute_Grids2MpInv_NewMethod, args=(prf_space, result_queue))
             MpInv_thread.start()
+            mpinv_thread_start_time = datetime.datetime.now()
 
         #...get Orthogonalization matrix
         ortho_matrix_dim = stimulus.NumFrames if (not stimulus.HighTemporalResolutionEnabled) else stimulus.NumFramesDownsampled
@@ -698,11 +711,13 @@ class GEMpRFAnalysis:
         #...get M-inverse matrix
         arr_2d_location_inv_M_cpu = None
         if cfg.refine_fitting_enabled:
-            inv_mat_join_start_time = datetime.datetime.now()            
+            inv_mat_join_start_time = datetime.datetime.now()
             MpInv_thread.join()
             if not result_queue.empty():
                 arr_2d_location_inv_M_cpu = result_queue.get()
-            Logger.print_green_message(f"Time taken to compute M-inverse matrix: {datetime.datetime.now() - inv_mat_join_start_time}\n", print_file_name=False)
+            # NOTE: the thread runs concurrently with the GPU work above, so the join only measures
+            # what is left of it; the thread's own wall time is the number to compare across runs.
+            Logger.print_green_message(f"Time taken to compute M-inverse matrix: {datetime.datetime.now() - mpinv_thread_start_time} (of which {datetime.datetime.now() - inv_mat_join_start_time} waiting after the GPU work)\n", print_file_name=False)
 
         # # end time
         # end_time = time.time()

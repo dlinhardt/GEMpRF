@@ -77,6 +77,9 @@ def manage_gpus(cfg, max_available_gpus):
 def run_selected_program(selected_program, config_filepath):
     cfg = GEMpRFAnalysis.load_config(config_filepath=config_filepath) # load default config
 
+    # [TIMING] lines stay quiet unless the config asks for debug info
+    Logger.enable_timing(cfg.write_debug_info)
+
     # NOTE: match versions
     config_file_version = cfg.config_data["@version"]
     if config_file_version != __version__:
@@ -142,8 +145,16 @@ def run_selected_program(selected_program, config_filepath):
         additional_dimensions = GEMpRFAnalysis.get_additional_dimensions(cfg, selected_prf_model)
         
     prf_space = PRFSpace(spatial_points_xy, additional_dimensions=additional_dimensions)
+
+    # build the full multi-dimensional grid (x, y, sigma)
+    _t0 = datetime.datetime.now()
     prf_space.convert_spatial_to_multidim()
+    Logger.print_timing_message(f"convert_spatial_to_multidim (build {len(spatial_points_xy)} xy x extra-dims grid): {datetime.datetime.now() - _t0}")
+
+    # keep only model-validated grid points
+    _t0 = datetime.datetime.now()
     prf_space.keep_validated_sampling_points(prf_model.get_validated_sampling_points_indices) # update the computed multi-dimensional points array
+    Logger.print_timing_message(f"keep_validated_sampling_points: {datetime.datetime.now() - _t0}")
 
     # NOTE
     _ = GemWriteToFile(result_dir = result_dir, debugging_enabled=cfg.write_debug_info) # initialize the GemWriteToFile singleton instance
