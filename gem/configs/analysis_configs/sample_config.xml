@@ -1,4 +1,4 @@
-<!-- 
+<!--
     "@Author  		:   Siddharth Mittal",
     "@Contact 		:   siddharth.mittal@meduniwien.ac.at",
     "@License 		:   (C)Copyright 2024 - 2025, Medical University of Vienna",
@@ -6,19 +6,19 @@
 	  "@Paper Title	:	GPU-Empowered Mapping of Population Receptive Fields for Large-Scale fMRI Analysis"
 -->
 
-<root version="0.1.14">
+<root version="0.1.15">
   <refine_fitting enable="True" refinefit_on_gpu="True"/> <!-- Execute refine fitting on GPU if sufficient GPU memory is available -->
-  
+
   <!-- Stimulus data -->
   <stimulus comment="Only in Nifti Format">
 
     <!-- File path for stimulus directory -->
-    <directory>Path/to/data/BIDS/stimuli</directory>	
+    <directory>Path/to/data/BIDS/stimuli</directory>
     <visual_field>8</visual_field> <!-- Visual field Radius -->
     <width>101</width>
     <height>101</height>
     <binarization enable="True" threshold="0"/> <!-- stimulus will be binarized if enabled, all values above threshold will be set to 1 and below to 0 -->
-    
+
     <!-- Compute model signals with high-res stimulus then downsample -->
     <!-- "num_frames_downsampled" = your fMRI timecourse length -->
     <!-- "slice_time_ref" for details see https://www.alivelearn.net/?p=1037 -->
@@ -30,7 +30,7 @@
 
 	<!-- Set to "True" if the input data is organized in BIDS format, select "individual" or "concatenated" run type -->
     <BIDS enable="True" run_type="individual" comment="options are individual/concatenated">
-	
+
       <basepath>Path/to/data/BIDS</basepath>
       <append_to_basepath>derivatives, fmriprep</append_to_basepath>
 
@@ -49,10 +49,10 @@
       <sub>all</sub>
       <hemi>all</hemi>
       <space comment="e.g. fsaverage/fsnative/T1w or all">fsnative</space>
-	  
+
 	  <!-- IMPORTANT: volumetric files will be flattend, and only files ending with '_bold.nii.gz' or '_bold.func.gii' will be processed -->
       <input_file_extension comment="options are .nii.gz/.gii/both">.gii</input_file_extension>
-        
+
       <!-- INDIVIDUAL Task/stimulus Analysis -->
       <individual>
         <task>fixedbar</task> <!-- ONLY one value is allowed -->
@@ -150,7 +150,7 @@
     <default_hrf t="(0, 45)" TR="1.0" peak_delay="6.16" under_shoot_delay="12.0"
                  peak_disp="0.85" under_disp="0.82" peak_to_undershoot="2.15"
                  normalize="true"/>
-                
+
     <default_spatial_grid visual_field_radius="12"
                           num_horizontal_prfs="51"
                           num_vertical_prfs="51"/>
