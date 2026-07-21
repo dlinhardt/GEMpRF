@@ -302,8 +302,10 @@ class PRFSpace:
         #NOTE: Validation of multi-dimensional points
         # NOTE: !!!!! if the validated pRF points are not computed until the function "compute_multidim_points_neighbours()" is called, ....
         # ...it means the user does not want to validate the points. In that case, we consider all multi-dimensional points are validated inside the function "compute_multidim_points_neighbours()" !!!!!
-        self.__validated_multidim_indices = None 
+        self.__validated_multidim_indices = None
         self.__full_2_validated_indices_mapping_dict = None
+
+        self.__grid_steps = None  # cached per-dimension grid spacing (see get_grid_steps)
 
     @property
     def points_xy(self):
@@ -364,6 +366,34 @@ class PRFSpace:
             list: A list of multi-dimensional points neighbours indices.
         """
         return self.__multi_dim_points_neighbours_flat_indices_list
+
+    def get_grid_steps(self)->np.ndarray:
+        """
+        Per-dimension spacing between adjacent grid points, in the column order of
+        ``multi_dim_points_cpu`` (i.e. [x, y, sigma, ...]).
+
+        Computed once (cached) as the median of the diffs between the sorted unique
+        values of each column. This is exact for the default uniform ``linspace`` grids
+        and robust to a non-uniform / file-defined sigma grid.
+
+        Returns:
+            numpy.ndarray: 1-D array of length ``num_total_dimensions`` with the grid step
+            of each dimension. A dimension with a single unique value yields a step of 0.
+        """
+        if self.__grid_steps is not None:
+            return self.__grid_steps
+
+        def _spacing(values):
+            unique_values = np.unique(np.asarray(values).ravel())
+            return float(np.median(np.diff(unique_values))) if unique_values.size > 1 else 0.0
+
+        # Derived from the small 1-D generators (spatial x/y columns + each extra dimension),
+        # NOT from a full copy of the multi-dim point cloud, so this stays cheap.
+        steps = [_spacing(self.points_xy[:, col]) for col in range(self.points_xy.shape[1])]
+        steps += [_spacing(dim) for dim in self.extra_dimensions]
+
+        self.__grid_steps = np.array(steps, dtype=np.float64)
+        return self.__grid_steps
 
     @staticmethod
     def make_extra_dimensions(*args):

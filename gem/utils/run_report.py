@@ -27,6 +27,7 @@ class RunReport:
         self.completed = []   # list of (input_desc, duration_sec)
         self.skipped = []     # list of result filepaths
         self.failed = []      # list of (input_desc, error_type, message, traceback_str)
+        self.grid_fallbacks = []  # list of (input_desc, stats_dict) for refined -> grid reverts
 
     # ------------------------------------------------------------------ counts
     @property
@@ -59,6 +60,11 @@ class RunReport:
             tb = ""
         self.failed.append((input_desc, type(exc).__name__, str(exc), tb))
 
+    def add_grid_fallback(self, input_desc, stats):
+        # stats: dict with keys total, on_grid, worse_error, x_too_far, y_too_far,
+        #        sigma_too_far, nan_refined, zero_signal
+        self.grid_fallbacks.append((input_desc, dict(stats)))
+
     # ------------------------------------------------------------------ render
     def render(self):
         duration = datetime.datetime.now() - self.start_time
@@ -90,6 +96,21 @@ class RunReport:
                 lines.append(f"    {error_type}: {message}")
                 if tb:
                     lines += [f"    {tb_line}" for tb_line in tb.rstrip().splitlines()]
+                lines.append("")
+
+        if self.grid_fallbacks:
+            title = "On-grid fallbacks (refined fit reverted to grid point)"
+            lines += ["", title, "-" * len(title)]
+            for input_desc, s in self.grid_fallbacks:
+                lines.append(f"  {input_desc}")
+                lines.append(f"      vertices                 : {s.get('total', 0)}")
+                lines.append(f"      reverted to grid (any)   : {s.get('on_grid', 0)}")
+                lines.append(f"        worse error            : {s.get('worse_error', 0)}")
+                lines.append(f"        x > 2 grid steps       : {s.get('x_too_far', 0)}")
+                lines.append(f"        y > 2 grid steps       : {s.get('y_too_far', 0)}")
+                lines.append(f"        sigma > 2 grid steps   : {s.get('sigma_too_far', 0)}")
+                lines.append(f"        nan refined params     : {s.get('nan_refined', 0)}")
+                lines.append(f"      zero model signal (R2=-2): {s.get('zero_signal', 0)}")
                 lines.append("")
 
         return "\n".join(lines) + "\n"

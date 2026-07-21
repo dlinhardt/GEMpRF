@@ -14,20 +14,20 @@ class ResultFileWriter:
         return os.path.exists(base + '.h5') or os.path.exists(base + '.json')
 
     @classmethod
-    def write(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec):
+    def write(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec, grid_steps=None):
         fmt = (cfg.results or {}).get('output_format', 'hdf5')
         base = os.path.splitext(filepath)[0]
         if fmt == 'json':
             cls.write_json(base + '.json', data)
         else:  # 'hdf5' or 'h5'
-            cls.write_h5(base + '.h5', data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec)
+            cls.write_h5(base + '.h5', data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec, grid_steps=grid_steps)
 
     @classmethod
     def write_json(cls, filepath, data):
         JsonMgr.write_to_file(filepath, data)
 
     @classmethod
-    def write_h5(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec):
+    def write_h5(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec, grid_steps=None):
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
         # unpack list-of-dicts into arrays
@@ -70,6 +70,11 @@ class ResultFileWriter:
             sg.create_dataset('num_sigmas',          data=int(cfg.default_sigmas['num_sigmas']))
             sg.create_dataset('min_sigma',           data=float(cfg.default_sigmas['min_sigma']))
             sg.create_dataset('max_sigma',           data=float(cfg.default_sigmas['max_sigma']))
+            # per-dimension grid spacing (degrees); the refined-fit -> grid fallback uses 2x these
+            if grid_steps is not None:
+                sg.create_dataset('x_grid_step',     data=float(grid_steps[0]))
+                sg.create_dataset('y_grid_step',     data=float(grid_steps[1]))
+                sg.create_dataset('sigma_grid_step', data=float(grid_steps[2]))
 
             # --- metadata/stimulus ---
             stg = f.create_group('metadata/stimulus')
