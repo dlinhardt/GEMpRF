@@ -192,7 +192,7 @@ def get_points_neighbours_chunk_Numba(chunk_multi_dim_points: np.ndarray, chunk_
         for dim_idx in range(num_extra_dimensions):
             dim_value = additional_dimensions[dim_idx]
             dim_value_idx = np.argmin(np.abs(extra_dimensions[dim_idx] - dim_value))
-            dim_neighbours_indices = np.arange(max(0, dim_value_idx - 1), min(len(extra_dimensions[dim_idx]), dim_value_idx + 2)) # NOTE: Earlier I used range() instead of np.arange()......Line below
+            dim_neighbours_indices = np.arange(max(0, dim_value_idx - 1), min(len(extra_dimensions[dim_idx]), dim_value_idx + 2))
             # # # # dim_neighbours_indices = np.array(np.arange(max(0, dim_value_idx - 1), min(len(extra_dimensions[dim_idx]), dim_value_idx + 2))) # NOTE: Earlier I used range() instead of np.arange()
             dim_neighbours = (extra_dimensions[dim_idx])[dim_neighbours_indices]
             extra_dimensions_neighbours_indices.append(dim_neighbours_indices) # reqired to get error gradients neighbours
@@ -204,7 +204,7 @@ def get_points_neighbours_chunk_Numba(chunk_multi_dim_points: np.ndarray, chunk_
             product_shape_extra_dimensions *= dim
 
         # neighbours_indices_multi_dim_points = neighbours_indices_xy * np.prod(shape_extra_dimensions)
-        neighbours_indices_multi_dim_points = neighbours_indices_xy * product_shape_extra_dimensions # NOTE: before Numba compatible ->> neighbours_indices_xy * np.prod(shape_extra_dimensions)
+        neighbours_indices_multi_dim_points = neighbours_indices_xy * product_shape_extra_dimensions
 
         # generate all combinations of extra dimension neighbours
         num_neighbours_per_extra_dimension = [len(extra_dimensions_neighbours[dim_idx]) for dim_idx in range(num_extra_dimensions)]
@@ -214,9 +214,9 @@ def get_points_neighbours_chunk_Numba(chunk_multi_dim_points: np.ndarray, chunk_
         total_neighbours = num_neighbors * product_num_neighbours_per_extra_dimension ##np.prod(num_neighbours_per_extra_dimension)
 
         current_point_neighbours_values = np.zeros((total_neighbours, num_total_dimensions))
-        current_point_neighbours_flat_indices = np.zeros((total_neighbours, 1), dtype=np.int64) # NOTE: before Numba compatible ->> np.zeros((total_neighbours, 1), dtype=int)
+        current_point_neighbours_flat_indices = np.zeros((total_neighbours, 1), dtype=np.int64)
 
-        # NOTE: both combinations are invariant in xy_idx, so build them once instead of per xy neighbour
+        # both combinations are invariant in xy_idx, so build them once instead of per xy neighbour
         extra_dim_coordinates_combinations = combination_generator_jit(extra_dimensions_neighbours_indices)
         extra_dim_values_combinations = combination_generator_jit(extra_dimensions_neighbours)
 
@@ -225,10 +225,10 @@ def get_points_neighbours_chunk_Numba(chunk_multi_dim_points: np.ndarray, chunk_
             for combination_idx in range(len(extra_dim_coordinates_combinations)):
             # # # # # # for dim_combination in itertools.product(*extra_dimensions_neighbours): ### NOTE: this is not NUMBA compatible
 
-                # NOTE: neighbours indices
+                # neighbours indices
                 multi_dim_flat_idx = neighbours_indices_multi_dim_points[xy_idx]
                 extra_dim_coordinates = extra_dim_coordinates_combinations[combination_idx]
-                extra_dim_flat = multidim2flatIdx(point=list(extra_dim_coordinates), shape=list(shape_extra_dimensions)) # NOTE: This needs to be CORRECTED. Use shape=shape_extra_dimensions
+                extra_dim_flat = multidim2flatIdx(point=list(extra_dim_coordinates), shape=list(shape_extra_dimensions))
 
                 # current_point_neighbours_flat_indices[counter] = multi_dim_flat_idx + extra_dim_flat #* len(points_xy) # NOTE: original
                 multi_dim_flat_idx = multi_dim_flat_idx + extra_dim_flat #* len(points_xy) # add extra-dimensions offset
@@ -238,7 +238,7 @@ def get_points_neighbours_chunk_Numba(chunk_multi_dim_points: np.ndarray, chunk_
                     continue
                 current_point_neighbours_flat_indices[counter] = multi_dim_flat_idx
 
-                # NOTE: neighbours values
+                # neighbours values
                 extra_dim_values = extra_dim_values_combinations[combination_idx]
                 current_point_neighbours_values[counter, :num_spatial_dimensions] = neighbours_xy[xy_idx]
                 current_point_neighbours_values[counter, num_spatial_dimensions:] = extra_dim_values
