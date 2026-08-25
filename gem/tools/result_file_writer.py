@@ -14,20 +14,21 @@ class ResultFileWriter:
         return os.path.exists(base + '.h5') or os.path.exists(base + '.json')
 
     @classmethod
-    def write(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec, grid_steps=None):
+    def write(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec, grid_steps=None, grid_fallback_records=None):
         fmt = (cfg.results or {}).get('output_format', 'hdf5')
         base = os.path.splitext(filepath)[0]
         if fmt == 'json':
             cls.write_json(base + '.json', data)
         else:  # 'hdf5' or 'h5'
-            cls.write_h5(base + '.h5', data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec, grid_steps=grid_steps)
+            cls.write_h5(base + '.h5', data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec,
+                         grid_steps=grid_steps, grid_fallback_records=grid_fallback_records)
 
     @classmethod
     def write_json(cls, filepath, data):
         JsonMgr.write_to_file(filepath, data)
 
     @classmethod
-    def write_h5(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec, grid_steps=None):
+    def write_h5(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec, grid_steps=None, grid_fallback_records=None):
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
         # unpack list-of-dicts into arrays
@@ -109,3 +110,41 @@ class ResultFileWriter:
             rg = f.create_group('metadata/run_info')
             rg.create_dataset('run_type',             data=str(run_type))
             rg.create_dataset('analysis_duration_sec', data=float(duration_sec))
+
+            # --- grid_fallback (per-vertex refined-fit rejection detail) ---
+            # Storage-efficient side table: only the rejected vertices are listed. The normal
+            # /parameters group is untouched (reverted vertices simply hold their grid point there),
+            # so this group is purely additive and ignored by readers that don't know about it.
+            cls._write_grid_fallback(f, grid_fallback_records)
+
+    @staticmethod
+    def _write_grid_fallback(f, records):
+        """Write the optional /grid_fallback group when there are rejected vertices to report.
+
+        ``records`` (from GEMpRFAnalysis._finalize_fallback_records) carries the flagged vertices
+        plus a self-describing reason legend, so nothing here needs to import the analysis module.
+        """
+        if not records:
+            return
+        vertex_index = np.asarray(records.get('vertex_index', []))
+        if vertex_index.size == 0:
+            return  # refine fitting off, or nothing was rejected -> no group at all
+
+        str_dt = h5py.special_dtype(vlen=str)
+
+        g = f.create_group('grid_fallback')
+        g.create_dataset('vertex_index',   data=vertex_index.astype(np.int32))
+        g.create_dataset('reason',         data=np.asarray(records['reason']).astype(np.uint8))
+        g.create_dataset('refined_params', data=np.asarray(records['refined_params']).astype(np.float32))
+
+        # legend so `reason` decodes without any external doc. Stored purely as datasets (visible in
+        # every h5 explorer) -- NOT as group attributes, which some explorers hide.
+        reason_bits = records.get('reason_bits', {})
+        param_columns = str(records.get('param_columns', 'Centerx0,Centery0,sigmaMajor'))
+        if reason_bits:
+            ordered = sorted(reason_bits.items(), key=lambda kv: kv[1])
+            legend = ', '.join(f'{int(bit)}={name}' for name, bit in ordered)
+            g.create_dataset('reason_legend',      data=str(legend))
+            g.create_dataset('reason_bit_names',   data=np.array([n for n, _ in ordered], dtype=str_dt))
+            g.create_dataset('reason_bit_values',  data=np.array([int(b) for _, b in ordered], dtype=np.uint8))
+        g.create_dataset('param_columns',          data=str(param_columns))

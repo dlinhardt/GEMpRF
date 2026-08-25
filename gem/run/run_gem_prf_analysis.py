@@ -60,6 +60,22 @@ from gem.signals.hrf_generator import spm_hrf_compat
 class GEMpRFAnalysis:
     __selected_prf_model = SelectedPRFModel.NoneType
 
+    # A refined fit is not trusted (and the vertex reverts to its coarse grid point) once it moves
+    # more than this many grid steps away from the grid point in x, y or sigma.
+    MAX_GRID_STEPS_AWAY = 10
+
+    # Bit values for the per-vertex rejection reason stored in the h5 /grid_fallback group.
+    # A vertex can trip several reasons at once, so the reasons are OR-ed into a single uint8.
+    # This dict is the single source of truth: the writer emits its bit->name legend into the file.
+    FALLBACK_REASON_BITS = {
+        "worse_error":   1,   # refinement increased the error (individual-run path only)
+        "nan_refined":   2,   # refined params came out NaN (degenerate solve)
+        "x_too_far":     4,   # |refined - coarse| in x     > MAX_GRID_STEPS_AWAY * x_step
+        "y_too_far":     8,   # |refined - coarse| in y     > MAX_GRID_STEPS_AWAY * y_step
+        "sigma_too_far": 16,  # |refined - coarse| in sigma > MAX_GRID_STEPS_AWAY * sigma_step
+        "zero_signal":   32,  # refined model timecourse all-zero -> R2 = -2 (individual-run path only)
+    }
+
     @classmethod
     def get_hrf_curve(cls, cfg, stimulus : Stimulus):
         if cfg.optional_analysis_params['enable'] and cfg.optional_analysis_params['hrf']['use_from_file']:
@@ -305,11 +321,12 @@ class GEMpRFAnalysis:
         diff = refined_error_vector - coarse_error_vector
         worse_error_mask = (~np.isnan(diff)) & (diff < 0)  # unchanged expression / behaviour
 
-        # NOTE: zero-signal reverts are handled implicitly (an all-zero refined timecourse means
+        # zero-signal reverts are handled implicitly (an all-zero refined timecourse means
         # the pRF drifted out of the aperture -> caught by the worse-error / too-far reasons, with
         # R2's own -2 sentinel as the final guard). We therefore do NOT scan the full signal matrix
         # on the device here (that temporary was doubling GPU memory in the hot batch loop); the
         # zero count for the report is read back cheaply from the R2 result instead.
+        # returns (refined_XY, stats, records); callers use the records to build the h5 side table.
         return cls.apply_grid_fallback(refined_matching_results_XY, coarse_pRF_estimations, grid_steps,
                                        worse_error_mask=worse_error_mask)
 
@@ -317,17 +334,25 @@ class GEMpRFAnalysis:
     def apply_grid_fallback(cls, refined_XY, coarse_XY, grid_steps, worse_error_mask=None, zero_mask=None):
         """
         Revert a vertex completely to its coarse grid point whenever the refined fit is not
-        trusted, and return ``(refined_XY, stats)``.
+        trusted, and return ``(refined_XY, stats, records)``.
 
         Reasons (all evaluated on the ORIGINAL refined values, so the revert set is a strict
         superset of the historical "worse error" revert -- untriggered vertices are unchanged):
           * worse_error   -- refinement increased the error   (only when a mask is provided)
           * nan_refined   -- refined params are NaN            (degenerate solve, was R2 = -1)
-          * x/y/sigma too far -- refined value moved > 2 grid steps from the grid point
+          * x/y/sigma too far -- refined value moved > MAX_GRID_STEPS_AWAY grid steps from the point
           * zero_signal   -- refined model timecourse is all zeros (only when a mask is provided,
                              was R2 = -2)
+
+        ``records`` is a small dict carrying the per-vertex rejection detail for the h5
+        ``/grid_fallback`` group (the callers add the batch offset + the zero-signal reason, then
+        select the flagged vertices):
+          * ``reason``      -- uint8 per-point bitmask (see ``FALLBACK_REASON_BITS``)
+          * ``refined_pre`` -- float32 copy of the ORIGINAL (pre-revert) refined params
         """
-        refined_np = cp.asnumpy(refined_XY)
+        bits = cls.FALLBACK_REASON_BITS
+        # Force a real copy so the numpy path does not alias refined_XY (overwritten in place below).
+        refined_np = np.array(cp.asnumpy(refined_XY))
         coarse_np  = cp.asnumpy(coarse_XY)
         num_points = refined_np.shape[0]
 
@@ -339,7 +364,7 @@ class GEMpRFAnalysis:
         nan_mask = np.isnan(refined_np).any(axis=1)
 
         delta = np.abs(refined_np - coarse_np)
-        too_far = delta > (2.0 * np.asarray(grid_steps))  # grid_steps: [x_step, y_step, sigma_step]
+        too_far = delta > (cls.MAX_GRID_STEPS_AWAY * np.asarray(grid_steps))  # grid_steps: [x_step, y_step, sigma_step]
         too_far_any = too_far.any(axis=1)
 
         revert_mask = worse_error_mask | nan_mask | too_far_any | zero_mask
@@ -359,7 +384,64 @@ class GEMpRFAnalysis:
             "on_grid": int(revert_mask.sum()),
         }
 
-        return refined_XY, stats
+        # Per-point reason bitmask (cheap boolean-OR over the batch vertex axis).
+        reason = np.zeros(num_points, dtype=np.uint8)
+        reason[worse_error_mask] |= bits["worse_error"]
+        reason[nan_mask]         |= bits["nan_refined"]
+        reason[too_far[:, 0]]    |= bits["x_too_far"]
+        reason[too_far[:, 1]]    |= bits["y_too_far"]
+        reason[too_far[:, 2]]    |= bits["sigma_too_far"]
+        reason[zero_mask]        |= bits["zero_signal"]
+
+        records = {"reason": reason, "refined_pre": refined_np.astype(np.float32, copy=False)}
+
+        return refined_XY, stats, records
+
+    @classmethod
+    def _select_fallback_records(cls, records, offset, r2_batch=None):
+        """Pick out the rejected vertices from one batch's ``apply_grid_fallback`` records.
+
+        Optionally OR in the zero-signal reason where the batch R2 hit its -2 sentinel (the
+        individual-run path passes ``r2_batch``; the concatenated path does not compute it), then
+        offset the batch-local indices by the batch's global start.
+
+        Returns ``(global_index int32, reason uint8, refined_params float32[K, D])`` for the
+        flagged vertices only (``K`` is usually a tiny fraction of the batch).
+        """
+        reason = records["reason"]
+        if r2_batch is not None:
+            zero_local = np.flatnonzero(np.asarray(r2_batch).ravel() == -2.0)
+            if zero_local.size:
+                reason = reason.copy()  # don't mutate the array owned by apply_grid_fallback
+                reason[zero_local] |= cls.FALLBACK_REASON_BITS["zero_signal"]
+        local = np.flatnonzero(reason)
+        return ((offset + local).astype(np.int32), reason[local], records["refined_pre"][local])
+
+    @classmethod
+    def _finalize_fallback_records(cls, index_parts, reason_parts, refined_parts, num_params):
+        """Concatenate the per-batch record pieces into the dict the h5 writer consumes.
+
+        The reason legend + column names travel inside the dict so the writer stays decoupled from
+        this (CuPy-importing) module and the h5 file is self-describing.
+        """
+        legend = {
+            "reason_bits": dict(cls.FALLBACK_REASON_BITS),
+            "param_columns": "Centerx0,Centery0,sigmaMajor",
+        }
+        if index_parts:
+            records = {
+                "vertex_index": np.concatenate(index_parts).astype(np.int32),
+                "reason": np.concatenate(reason_parts).astype(np.uint8),
+                "refined_params": np.concatenate(refined_parts, axis=0).astype(np.float32),
+            }
+        else:
+            records = {
+                "vertex_index": np.empty(0, dtype=np.int32),
+                "reason": np.empty(0, dtype=np.uint8),
+                "refined_params": np.empty((0, num_params), dtype=np.float32),
+            }
+        records.update(legend)
+        return records
 
     @classmethod
     def get_pRF_estimations(cls, cfg, O_gpu, prf_space, prf_model, stimulus, prf_analysis, arr_2d_location_inv_M_cpu, measured_data_filepath):
@@ -372,6 +454,8 @@ class GEMpRFAnalysis:
         grid_fallback_stats = {key: 0 for key in ("total", "worse_error", "nan_refined",
                                                   "x_too_far", "y_too_far", "sigma_too_far",
                                                   "zero_signal", "on_grid")}
+        # per-vertex rejection detail for the h5 /grid_fallback group (only flagged vertices)
+        fb_index_parts, fb_reason_parts, fb_refined_parts = [], [], []
 
          # y-signals
         y_data = ObservedData(data_source=DataSource.measured_data)
@@ -417,8 +501,9 @@ class GEMpRFAnalysis:
             coarse_pRF_estimations = (prf_space.multi_dim_points_cpu, prf_space.multi_dim_points_gpu)[((cfg.is_refinefit_on_gpu & cfg.refine_fitting_enabled) | (not cfg.refine_fitting_enabled))][best_fit_proj]
             
             # validate if the refined pRF estimations are really improving the error value, and for the pRF points where error is getting worse, keep the coarse pRF estimations
+            batch_fallback_records = None
             if cfg.refine_fitting_enabled:
-                valid_refined_prf_points_XY_batch, batch_fallback_stats = GEMpRFAnalysis.get_valid_refined_data(refined_matching_results_XY,
+                valid_refined_prf_points_XY_batch, batch_fallback_stats, batch_fallback_records = GEMpRFAnalysis.get_valid_refined_data(refined_matching_results_XY,
                                                                                           Y_signals_gpu=Y_signals_batch_gpu,
                                                                                           O_gpu=O_gpu,
                                                                                           prf_model=prf_model,
@@ -444,6 +529,13 @@ class GEMpRFAnalysis:
             # count them for the report without any extra signal scan.
             if cfg.refine_fitting_enabled:
                 grid_fallback_stats["zero_signal"] += int(np.count_nonzero(r2_results_batch == -2.0))
+                # per-vertex rejection detail: fold in the zero-signal reason (R2 == -2), offset the
+                # batch-local indices to global vertex indices, keep only the flagged vertices.
+                idx, rsn, ref = cls._select_fallback_records(batch_fallback_records, current_batch_idx, r2_batch=r2_results_batch)
+                if idx.size:
+                    fb_index_parts.append(idx)
+                    fb_reason_parts.append(rsn)
+                    fb_refined_parts.append(ref)
 
             # concatenate the batch results
             if current_batch_idx == 0:
@@ -455,7 +547,9 @@ class GEMpRFAnalysis:
                 valid_refined_S_cpu = np.concatenate((valid_refined_S_cpu, valid_refined_S_cpu_batch), axis = 0)
                 r2_results = np.concatenate((r2_results, r2_results_batch), axis = 0)            
 
-        return valid_refined_prf_points_XY, r2_results, valid_refined_S_cpu, grid_fallback_stats
+        grid_fallback_records = cls._finalize_fallback_records(fb_index_parts, fb_reason_parts, fb_refined_parts,
+                                                               num_params=int(np.asarray(grid_steps).shape[0]))
+        return valid_refined_prf_points_XY, r2_results, valid_refined_S_cpu, grid_fallback_stats, grid_fallback_records
 
     ##########################################################---------------------------------RUN---------------------------------################################################
     @classmethod
@@ -561,7 +655,7 @@ class GEMpRFAnalysis:
         # grid spacing used by the refined-fit -> grid fallback (verbose only)
         grid_steps = prf_space.get_grid_steps()
         if cfg.refine_fitting_enabled:
-            Logger.print_timing_message(f"Grid steps: x={grid_steps[0]:.3f} deg, y={grid_steps[1]:.3f} deg, sigma={grid_steps[2]:.3f} deg (fallback threshold = 2x)")
+            Logger.print_timing_message(f"Grid steps: x={grid_steps[0]:.3f} deg, y={grid_steps[1]:.3f} deg, sigma={grid_steps[2]:.3f} deg (fallback threshold = {GEMpRFAnalysis.MAX_GRID_STEPS_AWAY}x)")
 
         counter = 0
         for concatenate_block_info in required_concatenations_info:
@@ -590,17 +684,21 @@ class GEMpRFAnalysis:
                                      counter, num_concatenation_blocks, start_time):
         """Run a single concatenation block. Raises on failure; the caller records it in the run report.
 
-        Returns the per-block grid-fallback stats dict (how many vertices reverted to the grid
-        point and why). NOTE: the concatenated path deliberately does not recompute the per-task
-        error for validation (too costly across all stimuli), so the parameter-based reasons
-        (nan / too-far) are applied here before the model timecourses are synthesised; the
-        worse-error and zero-signal reasons are not evaluated on this path (reported as 0).
+        Returns ``(block_fallback_stats, block_fallback_records)``: the per-block grid-fallback stats
+        dict (how many vertices reverted to the grid point and why) and the per-vertex rejection
+        detail for the h5 /grid_fallback group. NOTE: the concatenated path deliberately does not
+        recompute the per-task error for validation (too costly across all stimuli), so the
+        parameter-based reasons (nan / too-far) are applied here before the model timecourses are
+        synthesised; the worse-error and zero-signal reasons are not evaluated on this path
+        (reported as 0).
         """
         json_data = None
         grid_steps = prf_space.get_grid_steps()
         block_fallback_stats = {key: 0 for key in ("total", "worse_error", "nan_refined",
                                                    "x_too_far", "y_too_far", "sigma_too_far",
                                                    "zero_signal", "on_grid")}
+        # per-vertex rejection detail for the h5 /grid_fallback group (only flagged vertices)
+        fb_index_parts, fb_reason_parts, fb_refined_parts = [], [], []
         # Collect Y-Signals
         arr_Y_signals_cpu = []
         num_concatenation_items = len(concatenate_block_info.filepaths_to_be_concatenated)
@@ -648,7 +746,7 @@ class GEMpRFAnalysis:
                 arr_e_list.append(e_gpu)
                 arr_de_dtheta_full_list.append(de_dtheta_full_list)
 
-            # NOTE: process this batch of concatenation block
+            # process this batch of concatenation block
             # ...sum up the error terms (e and de_dtheta) for all the runs
             # ...current Y-BATCH concatenated error terms                                            
             xp = cp if refinefit_on_gpu else np
@@ -675,17 +773,23 @@ class GEMpRFAnalysis:
                                                                                 arr_2d_location_inv_M_cpu=arr_2d_location_inv_M_cpu,
                                                                                 e_full=concatenated_e,  # send overall error terms
                                                                                 de_dtheta_3darr=concatenated_de_dtheta)
-                # parameter-based fallback (nan / >2 grid steps) applied before signal synthesis,
+                # parameter-based fallback (nan / too-far) applied before signal synthesis,
                 # so reverted vertices get the correct grid-point timecourse below.
                 coarse_pRF_estimations = (prf_space.multi_dim_points_cpu, prf_space.multi_dim_points_gpu)[((cfg.is_refinefit_on_gpu & cfg.refine_fitting_enabled) | (not cfg.refine_fitting_enabled))][best_fit_proj]
-                refined_matching_results_XY, batch_fallback_stats = cls.apply_grid_fallback(refined_matching_results_XY, coarse_pRF_estimations, grid_steps)
+                refined_matching_results_XY, batch_fallback_stats, batch_fallback_records = cls.apply_grid_fallback(refined_matching_results_XY, coarse_pRF_estimations, grid_steps)
                 for key in block_fallback_stats:
                     block_fallback_stats[key] += batch_fallback_stats[key]
+                # per-vertex rejection detail (nan / too-far only on this path; no zero-signal R2 here)
+                idx, rsn, ref = cls._select_fallback_records(batch_fallback_records, current_batch_idx)
+                if idx.size:
+                    fb_index_parts.append(idx)
+                    fb_reason_parts.append(rsn)
+                    fb_refined_parts.append(ref)
             else:
                 coarse_pRF_estimations = (prf_space.multi_dim_points_cpu, prf_space.multi_dim_points_gpu)[((cfg.is_refinefit_on_gpu & cfg.refine_fitting_enabled) | (not cfg.refine_fitting_enabled))][best_fit_proj]
                 block_fallback_stats["total"] += int(coarse_pRF_estimations.shape[0])
                                         
-            # # # NOTE NOTE NOTE: Validate the refined results!!!!!!!!!!! STEP MISSING: because for this, we need to compute the results with the all stimuli used for different tasks, it will waste a lot of time.
+            # Refined-result validation is skipped here: it would require recomputing with every task's stimulus, which is expensive.
             # # coarse_pRF_estimations = prf_space.multi_dim_points_cpu[best_fit_proj_cpu]
             # # valid_refined_prf_points_XY_batch = GEMpRFAnalysis.get_valid_refined_data(refined_matching_results_XY, 
             # #                                                                           Y_signals_gpu=Y_signals_batch_gpu, # NOTE: here we would need to pass the list of signals for all concatenated_item
@@ -734,7 +838,10 @@ class GEMpRFAnalysis:
 
             # print ("Refined fitting done...")
 
-        # NOTE: Write the full results of the current concatenation block to file
+        block_fallback_records = cls._finalize_fallback_records(fb_index_parts, fb_reason_parts, fb_refined_parts,
+                                                                num_params=int(np.asarray(grid_steps).shape[0]))
+
+        # Write the full results of the current concatenation block to file
         ResultFileWriter.write(
             filepath=concatenate_block_info.concatenation_result_filepath,
             data=json_data,
@@ -744,6 +851,7 @@ class GEMpRFAnalysis:
             run_type='concatenated',
             duration_sec=time.time() - start_time,
             grid_steps=grid_steps,
+            grid_fallback_records=block_fallback_records,
         )
 
         Logger.print_green_message(f"Results written to file: {concatenate_block_info.concatenation_result_filepath}", print_file_name=False)
@@ -809,7 +917,7 @@ class GEMpRFAnalysis:
             MpInv_thread.join()
             if not result_queue.empty():
                 arr_2d_location_inv_M_cpu = result_queue.get()
-            # NOTE: the thread runs concurrently with the GPU work above, so the join only measures
+            # the thread runs concurrently with the GPU work above, so the join only measures
             # what is left of it; the thread's own wall time is the number to compare across runs.
             Logger.print_green_message(f"Time taken to compute M-inverse matrix: {datetime.datetime.now() - mpinv_thread_start_time} (of which {datetime.datetime.now() - inv_mat_join_start_time} waiting after the GPU work)\n", print_file_name=False)
 
@@ -822,7 +930,7 @@ class GEMpRFAnalysis:
         # grid spacing used by the refined-fit -> grid fallback (verbose only)
         grid_steps = prf_space.get_grid_steps()
         if cfg.refine_fitting_enabled:
-            Logger.print_timing_message(f"Grid steps: x={grid_steps[0]:.3f} deg, y={grid_steps[1]:.3f} deg, sigma={grid_steps[2]:.3f} deg (fallback threshold = 2x)")
+            Logger.print_timing_message(f"Grid steps: x={grid_steps[0]:.3f} deg, y={grid_steps[1]:.3f} deg, sigma={grid_steps[2]:.3f} deg (fallback threshold = {GEMpRFAnalysis.MAX_GRID_STEPS_AWAY}x)")
 
         # pRF Estimations
         file_processed_counter = 1
@@ -845,7 +953,7 @@ class GEMpRFAnalysis:
             file_processed_counter += 1
 
             try:
-                valid_refined_prf_points_XY, r2_results, valid_refined_S_cpu, grid_fallback_stats = GEMpRFAnalysis.get_pRF_estimations(cfg, O_gpu, prf_space, prf_model, stimulus, prf_analysis, arr_2d_location_inv_M_cpu, measured_data_filepath)
+                valid_refined_prf_points_XY, r2_results, valid_refined_S_cpu, grid_fallback_stats, grid_fallback_records = GEMpRFAnalysis.get_pRF_estimations(cfg, O_gpu, prf_space, prf_model, stimulus, prf_analysis, arr_2d_location_inv_M_cpu, measured_data_filepath)
                 # profiler.disable()
                 # stats = pstats.Stats(profiler, stream=profile_stream)
                 # stats.strip_dirs().sort_stats("cumulative").print_stats(20)  # Top 20 most time-consuming calls
@@ -866,6 +974,7 @@ class GEMpRFAnalysis:
                     run_type='individual',
                     duration_sec=time.time() - start_time,
                     grid_steps=grid_steps,
+                    grid_fallback_records=grid_fallback_records,
                 )
             except Exception as exc:
                 Logger.print_red_message(f"Analysis FAILED for {measured_data_filepath}: {exc}", print_file_name=False)
