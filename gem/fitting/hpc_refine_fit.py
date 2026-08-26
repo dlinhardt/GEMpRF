@@ -20,9 +20,13 @@ class RefineFit:
 
     @classmethod
     def _prepare_padded_arrays(cls, arr_2d_location_inv_M_cpu, prf_space, on_gpu):
-        """Prepare padded arrays for arr_2d_location_inv_M and multi_dim_points_neighbours."""
-        pkg = (np, cp)[on_gpu]
+        """Prepare padded arrays for arr_2d_location_inv_M and multi_dim_points_neighbours.
 
+        NOTE: both stay in host memory regardless of ``on_gpu``. The padded M-inverse is
+        (num_model_signals, 10, max_neighbours * 4) float64 -- several GB for a dense grid -- but only
+        the ``num_y_signals`` rows of the current batch are ever read, so keeping it on the device
+        wasted most of a card for a few MB of gathers per batch.
+        """
         # --- 1a) Prepare arr_2d_location_inv_M ---
         arr_2d_location_inv_M_cpu_list = arr_2d_location_inv_M_cpu
         N = len(arr_2d_location_inv_M_cpu_list)
@@ -63,43 +67,61 @@ class RefineFit:
             padded_all = np.insert(all_concat, where_to_pad2, -1) if where_to_pad2.size else all_concat
             padded_neigh_cpu = padded_all.reshape(N, max_len)
 
-        # --- Convert to GPU if requested ---
-        if on_gpu:
-            cls.padded_arr_2d_location_inv_M = cp.asarray(padded_arr_cpu)
-            cls.padded_multi_dim_points_neighbours_flat_indices = cp.asarray(padded_neigh_cpu.astype(np.int64))[:, :, None]
-        else:
-            cls.padded_arr_2d_location_inv_M = padded_arr_cpu
-            cls.padded_multi_dim_points_neighbours_flat_indices = padded_neigh_cpu.astype(np.int64)[:, :, None]
+        # --- Both stay on the host; only the per-batch slice is moved to the device ---
+        cls.padded_arr_2d_location_inv_M = padded_arr_cpu
+        cls.padded_multi_dim_points_neighbours_flat_indices = padded_neigh_cpu.astype(np.int64)[:, :, None]
 
 
     @classmethod
+    def get_neighbour_columns(cls, prf_space: PRFSpace, best_fit_proj, arr_2d_location_inv_M_cpu):
+        """Columns of the error/derivative matrices that the refinement will read.
+
+        Returns a host (num_Y_signals, max_neighbours) int array of validated-grid column indices for
+        the neighbourhood of each y-signal's winning grid point, padded with -1. The caller needs
+        these before the derivative terms are computed, which is why this is split out of
+        ``get_refined_fit_results``.
+        """
+        if cls.padded_arr_2d_location_inv_M is None or cls.padded_multi_dim_points_neighbours_flat_indices is None:
+            cls._prepare_padded_arrays(arr_2d_location_inv_M_cpu, prf_space, on_gpu=False)
+
+        best_fit_proj_cpu = cls._as_host_indices(best_fit_proj)
+        all_block_flat_indices_cpu = cls.padded_multi_dim_points_neighbours_flat_indices[best_fit_proj_cpu].squeeze()
+        return prf_space.get_full_2_validated_indices(all_block_flat_indices_cpu, invalid_key_value=-1).reshape(all_block_flat_indices_cpu.shape)
+
+    @classmethod
+    def _as_host_indices(cls, best_fit_proj):
+        return cp.asnumpy(best_fit_proj) if isinstance(best_fit_proj, cp.ndarray) else np.asarray(best_fit_proj)
+
+    @classmethod
     def get_refined_fit_results(cls, prf_space: PRFSpace, num_Y_signals, best_fit_proj,
-                                arr_2d_location_inv_M_cpu, e_full, de_dtheta_3darr):
-        on_gpu = isinstance(e_full, cp.ndarray)
+                                arr_2d_location_inv_M_cpu, refine_input_vecs, neighbour_columns):
+        """Solve the local quadratic for every y-signal.
+
+        ``refine_input_vecs`` is (num_Y_signals, max_neighbours, num_params + 1), already gathered at
+        ``neighbour_columns`` by GridFit -- the dense (num_Y_signals, num_model_signals, num_params+1)
+        block this used to build itself was the largest single allocation in the fit.
+        """
+        on_gpu = isinstance(refine_input_vecs, cp.ndarray)
         pkg = (np, cp)[on_gpu]
 
-        # ---------- Step 1: Padded arrays (keep your optimized version) ----------
         if cls.padded_arr_2d_location_inv_M is None or cls.padded_multi_dim_points_neighbours_flat_indices is None:
-            cls._prepare_padded_arrays(arr_2d_location_inv_M_cpu, prf_space, on_gpu)
+            cls._prepare_padded_arrays(arr_2d_location_inv_M_cpu, prf_space, on_gpu=False)
 
-        # ---------- Step 2: Gather indices ----------
-        all_block_flat_indices = cls.padded_multi_dim_points_neighbours_flat_indices[best_fit_proj].squeeze()
-        all_block_flat_indices_cpu = pkg.asnumpy(all_block_flat_indices) if on_gpu else all_block_flat_indices
-        all_validated_block_flat_indices_cpu = prf_space.get_full_2_validated_indices(all_block_flat_indices_cpu, invalid_key_value=-1).reshape(all_block_flat_indices_cpu.shape)
-        all_validated_block_flat_indices = pkg.asarray(all_validated_block_flat_indices_cpu)
+        # ---------- Gather MpInv for this batch (host-side fancy index, then one small upload) ----------
+        best_fit_proj_cpu = cls._as_host_indices(best_fit_proj)
+        all_MpInv = cls.padded_arr_2d_location_inv_M[best_fit_proj_cpu]
+        if on_gpu:
+            all_MpInv = cp.asarray(all_MpInv)
 
-        # ---------- Step 3: Gather MpInv ----------
-        all_MpInv = cls.padded_arr_2d_location_inv_M[best_fit_proj]
+        validated_indices = pkg.asarray(neighbour_columns)
 
-        # ---------- Step 4-6: Compute coefficients in helper ----------
-        # coefficients = MpInv@vec
-        coefficients = cls._compute_coefficients(pkg, num_Y_signals, e_full, de_dtheta_3darr,
-                                                all_validated_block_flat_indices, all_MpInv, on_gpu)
+        # ---------- Compute coefficients: coefficients = MpInv@vec ----------
+        coefficients = cls._compute_coefficients(pkg, refine_input_vecs, validated_indices, all_MpInv)
 
-        # ---------- Step 7: Build A, B, C ----------
+        # ---------- Build A, B, C ----------
         A, B, C = CoefficientMatrix.create_cofficients_matrices_A_B_and_C_vectorized(coefficients)
 
-        # ---------- Step 8: Solve system ----------
+        # ---------- Solve system ----------
         refined_params_vecs_gpu = pkg.einsum('fij,fj->fi', pkg.linalg.pinv(2*A), -B) # as some of the A matrices might be singular so using pinv instead of inv
 
         return refined_params_vecs_gpu, None
@@ -107,45 +129,29 @@ class RefineFit:
 
     # ----------------- Helper functions -----------------
     @classmethod
-    def _compute_coefficients(cls, pkg, num_Y_signals, e_full, de_dtheta_3darr, validated_indices, MpInv, on_gpu):
-        """Compute coefficients with intermediate arrays freed early."""
-        # Transpose de_dtheta to shape (num_Y_signals, num_models, num_params)
-        de_dtheta_transposed = de_dtheta_3darr.transpose(1, 2, 0)
-        e_full_expanded = e_full[:, :, pkg.newaxis]
+    def _compute_coefficients(cls, pkg, vecs, validated_indices, MpInv):
+        """Compute coefficients from the pre-gathered neighbourhood values.
 
-        # Concatenate along last dim
-        combined = pkg.concatenate([e_full_expanded, de_dtheta_transposed], axis=2) # shape: (num_Y_signals, num_models_signals, num_params+1)
-
-        # Gather vecs
-        # About validated_indices ...
-        # ...it has shape (number_of_signals, max_possible_neighbours_per_prf)
-        # ...it stores neighbor indices for each pRF
-        # ...since some pRFs have fewer neighbors, validated_indices is padded with -1 for missing entries
-        # ...during indexing, -1 is temporarily replaced (e.g., with 0) and then masked to NaN
-        # vecs shape: (num_Y_signals, max_neighbors, num_params+1)
-        vecs = combined[pkg.arange(num_Y_signals)[:, None], validated_indices.clip(min=0)] # replaces -1 with 0 temporarily, because negative indices would index from the end in Python
+        About validated_indices ...
+        ...it has shape (number_of_signals, max_possible_neighbours_per_prf)
+        ...it stores neighbor indices for each pRF
+        ...since some pRFs have fewer neighbors, validated_indices is padded with -1 for missing entries
+        ...the padded slots are masked to NaN here and then zeroed, exactly as before
+        """
         vecs = pkg.where(validated_indices[..., None] == -1, pkg.nan, vecs) # Mask invalid indices
 
-        # Flatten vecs
+        # Flatten vecs -- (num_Y_signals, (num_params+1) * max_neighbours), neighbour-major
         flattened_vecs = vecs.reshape(vecs.shape[0], -1)
-
-        # Free intermediate arrays early
-        del combined, vecs
-        # if on_gpu:
-        #     cp._default_memory_pool.free_all_blocks()
+        del vecs
 
         # Set NaNs to 0 so that we can do matrix multiplication and the values do not affect the result
         MpInv_masked = pkg.nan_to_num(MpInv, nan=0.0)
         vecs_masked = pkg.nan_to_num(flattened_vecs, nan=0.0)
         del flattened_vecs
-        # if on_gpu:
-        #     cp._default_memory_pool.free_all_blocks()
 
         # Compute coefficients
         coefficients = pkg.einsum('fvi,fi->fv', MpInv_masked, vecs_masked) # coefficients = MpInv@vec
         del MpInv_masked, vecs_masked
-        # if on_gpu:
-        #     cp._default_memory_pool.free_all_blocks()
 
         return coefficients
 
