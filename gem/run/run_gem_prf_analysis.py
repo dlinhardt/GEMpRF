@@ -353,6 +353,19 @@ class GEMpRFAnalysis:
           * ``refined_pre`` -- float32 copy of the ORIGINAL (pre-revert) refined params
         """
         bits = cls.FALLBACK_REASON_BITS
+        # NOTE: sigma is a magnitude. The Gaussian is even in it -- exp(-r^2 / 2*sigma^2), and the x
+        # and y derivative kernels divide by sigma^2 -- so +s and -s are the same pRF with the same
+        # signal, the same error and the same R2. Nothing keeps the quadratic surrogate on the
+        # positive branch, though, so a refinement can come back negative, and the distance check
+        # below then measured |refined - coarse| across the sign: a fit sitting 0.28 deg from its
+        # grid point looked 1.28 deg away. Whether that tripped the threshold depended on how large
+        # sigma happened to be, so identical pRFs were judged differently. Normalising here, before
+        # the check and before refined_XY is handed back, fixes the metric and the reported value in
+        # one place. Fit quality is still guarded by worse_error, which cannot be affected: the model
+        # signal does not depend on the sign. Column 2 is sigma, matching grid_steps and too_far[:, 2].
+        if refined_XY.shape[1] > 2:
+            refined_XY[:, 2] = abs(refined_XY[:, 2]) # abs() dispatches for both numpy and cupy arrays
+
         # Force a real copy so the numpy path does not alias refined_XY (overwritten in place below).
         refined_np = np.array(cp.asnumpy(refined_XY))
         coarse_np  = cp.asnumpy(coarse_XY)

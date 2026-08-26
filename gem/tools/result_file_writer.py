@@ -31,21 +31,24 @@ class ResultFileWriter:
     def write_json(cls, filepath, data):
         """Serialise the estimates as JSON, rounded.
 
-        NOTE: the rounding belongs here and nowhere else. It used to live in
-        JsonMgr.args2jsonEntry() -- whose name reads as JSON-only -- but write_h5() unpacks the very
-        same dicts, so every HDF5 result was quantised to 1e-4 as well: pRF centres pinned to a
-        0.0001 deg lattice, in the format that is meant to be the precise one.
+        NOTE: the rounding belongs here and nowhere else. It used to live in the record builder,
+        back when that was called args2jsonEntry and read as JSON-only -- but write_h5() unpacks
+        the very same dicts, so every HDF5 result was quantised to 1e-4 as well: pRF centres
+        pinned to a 0.0001 deg lattice, in the format that is meant to be the precise one.
         """
         rounded = [{key: cls._rounded_value(value) for key, value in record.items()} for record in data]
         JsonMgr.write_to_file(filepath, rounded)
 
     @classmethod
     def _rounded_value(cls, value):
+        # NOTE: modelpred is a list, but not always a list of numbers. When the refined timecourses
+        # are not kept, format_in_json_format() fills it with np.array([None]).tolist() -- i.e.
+        # [None] -- so elements have to be checked individually, not just the container.
         if isinstance(value, list): # modelpred, a whole timecourse
-            return [round(float(element), cls.JSON_DECIMALS) for element in value]
-        if isinstance(value, (int, float, np.floating, np.integer)):
+            return [cls._rounded_value(element) for element in value]
+        if isinstance(value, (int, float, np.floating, np.integer)) and not isinstance(value, bool):
             return round(float(value), cls.JSON_DECIMALS)
-        return value # None (modelpred omitted), strings, anything added later
+        return value # None, strings, anything added later
 
     @classmethod
     def write_h5(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec, grid_steps=None, grid_fallback_records=None):

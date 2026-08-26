@@ -22,13 +22,13 @@ class JsonMgr:
 
 
     @classmethod
-    def args2jsonEntry(cls, muX, muY, sigma, r2, signal):
+    def args2estimate_record(cls, muX, muY, sigma, r2, signal):
         """Build the one estimate record both writers (JSON and HDF5) unpack.
 
-        Despite the name this is NOT a JSON-specific structure: ResultFileWriter.write_h5() unpacks
-        exactly these dicts. Values are kept at full precision here and rounded only by the JSON
-        writer, which is a human-readable dump. Rounding used to happen right here, so every HDF5
-        result was quantised to 1e-4 -- far coarser than the float32 the datasets hold.
+        Named for what it is, not for one of its consumers: ResultFileWriter.write_h5() unpacks
+        exactly these dicts too. It used to be called args2jsonEntry, which is why the rounding
+        ended up in here -- and therefore quantised every HDF5 result to 1e-4, far coarser than
+        the float32 the datasets hold. Values are kept at full precision; only write_json rounds.
 
         NOTE: sigma is stored as a magnitude. The Gaussian is even in sigma -- it enters as
         exp(-r^2 / 2*sigma^2) -- so +s and -s describe the identical pRF and nothing constrains the

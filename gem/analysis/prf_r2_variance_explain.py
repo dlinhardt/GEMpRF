@@ -95,7 +95,7 @@ class R2:
                 refined_signal_timecourse = refined_signal_timecourses[i]
             else:        
                 refined_signal_timecourse = np.array([None])
-            json_entry = JsonMgr.args2jsonEntry(muX, muY, sigma, r2, refined_signal_timecourse)    
+            json_entry = JsonMgr.args2estimate_record(muX, muY, sigma, r2, refined_signal_timecourse)    
             json_data_results_with_r2.append(json_entry)    
 
         return json_data_results_with_r2   
