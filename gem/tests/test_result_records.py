@@ -1,14 +1,14 @@
 """The estimate record that both result writers unpack, and where rounding is allowed to happen.
 
-`JsonMgr.args2jsonEntry` is the single place where a fitted vertex becomes a record; the JSON writer
+`JsonMgr.args2estimate_record` is the single place where a fitted vertex becomes a record; the JSON writer
 serialises it and `ResultFileWriter.write_h5` unpacks the same dicts into HDF5 datasets. Two things
 have gone wrong at that junction and both are pinned here:
 
   * sigma reached the file signed. The Gaussian is even in sigma, so the refined fit is free to land
     on the negative branch and a negative pRF size is simply wrong output.
-  * the record was rounded to 4 decimals. The name `args2jsonEntry` suggests that only concerns
-    JSON, but the HDF5 writer consumes the same dicts, so the precise format was quantised to 1e-4
-    -- much coarser than the float32 it stores. Rounding now happens in `write_json` alone.
+  * the record was rounded to 4 decimals. Its old name, `args2jsonEntry`, read as JSON-only, but
+    the HDF5 writer consumes the same dicts, so the precise format was quantised to 1e-4 -- much
+    coarser than the float32 it stores. Rounding now happens in `write_json` alone.
 
 No CuPy involved -- these run anywhere.
 """
@@ -29,7 +29,7 @@ PRECISE_SIGMA = 1.4142135623730951
 
 
 def _entry(sigma, muX=3.0, muY=2.0, r2=0.5):
-    return JsonMgr.args2jsonEntry(muX=muX, muY=muY, sigma=sigma, r2=r2, signal=SIGNAL)
+    return JsonMgr.args2estimate_record(muX=muX, muY=muY, sigma=sigma, r2=r2, signal=SIGNAL)
 
 
 @pytest.mark.parametrize("sigma", [-0.7795, -0.5469, -0.0666, -5.0])
@@ -107,3 +107,32 @@ def test_json_writer_handles_a_missing_modelpred(tmp_path):
 
     with open(os.path.join(tmp_path, "estimates.json")) as handle:
         assert json.load(handle)[0]["modelpred"] is None
+
+
+def test_json_writer_handles_a_none_inside_the_modelpred_list(tmp_path):
+    """The real shape of a dropped timecourse is [None], not None.
+
+    format_in_json_format() writes np.array([None]).tolist() when the refined signals are not kept,
+    so the container is a list and only its elements are None. Checking the container alone let
+    float(None) through and killed the whole analysis -- but only on the JSON path, because write_h5
+    tests modelpred_list[0] and skips the dataset entirely.
+    """
+    record = _entry(1.0)
+    record["modelpred"] = [None]
+    ResultFileWriter.write_json(os.path.join(tmp_path, "estimates.json"), [record])
+
+    with open(os.path.join(tmp_path, "estimates.json")) as handle:
+        assert json.load(handle)[0]["modelpred"] == [None]
+
+
+def test_json_writer_rounds_a_real_modelpred(tmp_path):
+    """A timecourse that is present still gets rounded element by element."""
+    record = _entry(1.0)
+    record["modelpred"] = [PRECISE_X, None, PRECISE_R2]
+    ResultFileWriter.write_json(os.path.join(tmp_path, "estimates.json"), [record])
+
+    with open(os.path.join(tmp_path, "estimates.json")) as handle:
+        written = json.load(handle)[0]["modelpred"]
+
+    assert written == [round(PRECISE_X, ResultFileWriter.JSON_DECIMALS), None,
+                       round(PRECISE_R2, ResultFileWriter.JSON_DECIMALS)]

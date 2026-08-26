@@ -146,8 +146,14 @@ def test_single_chunk_error_matrix_matches_the_assembled_path():
         assembled = GridFit.compute_error_matrix(Y, [S_prime], out=out, accumulate=False)
 
         np.testing.assert_array_equal(cp.asnumpy(short_circuit), cp.asnumpy(assembled))
-        # the degenerate column must score worst, not best
-        assert bool(cp.all(cp.isneginf(short_circuit[:, 4])))
+
+        # The degenerate column must not score as a *best* fit. It comes out NaN rather than +inf
+        # whenever Y has mixed signs -- the product sums +inf and -inf -- and nanargmax skips NaN,
+        # so either outcome is safe; what must never survive is a +inf, which would win the argmax.
+        degenerate = cp.asnumpy(short_circuit[:, 4])
+        assert np.all(np.isneginf(degenerate) | np.isnan(degenerate)), \
+            f"degenerate column scored {degenerate}, expected -inf or NaN"
+        assert not np.isposinf(cp.asnumpy(short_circuit)).any(), "no +inf may survive"
 
 
 def test_error_matrix_accumulates_across_concatenated_runs():

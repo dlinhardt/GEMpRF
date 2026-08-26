@@ -232,3 +232,62 @@ def test_run_report_grid_fallback_section():
     assert "reverted to grid" in rendered
     assert "sub-01_estimates.h5" in rendered
     assert "zero model signal (R2=-2): 5" in rendered
+
+
+def test_sigma_is_compared_as_a_magnitude():
+    """A refinement that came back with negative sigma is the same pRF, and must be judged as one.
+
+    The Gaussian is even in sigma, so +s and -s produce an identical model signal, error and R2. The
+    distance check used to measure |refined - coarse| across the sign, which inflated the distance by
+    2|sigma| and made the verdict depend on how large sigma happened to be -- identical models were
+    reverted or kept depending on their magnitude.
+    """
+    from gem.run.run_gem_prf_analysis import GEMpRFAnalysis
+
+    sigma_step = GRID_STEPS[2]
+    limit = GEMpRFAnalysis.MAX_GRID_STEPS_AWAY * sigma_step
+    coarse_sigma = 3.0
+    # |refined| sits well inside the limit, but the signed difference is far outside it
+    refined_sigma = -(coarse_sigma + 0.25 * limit)
+    assert abs(refined_sigma - coarse_sigma) > limit
+    assert abs(abs(refined_sigma) - coarse_sigma) < limit
+
+    coarse = np.array([[0.2, 0.1, coarse_sigma]])
+    refined = np.array([[0.2, 0.1, refined_sigma]])
+
+    kept, stats, _ = GEMpRFAnalysis.apply_grid_fallback(refined.copy(), coarse, GRID_STEPS)
+
+    assert stats["sigma_too_far"] == 0, "the sign must not count as distance"
+    assert stats["on_grid"] == 0, "the refinement is close enough to keep"
+    assert kept[0, 2] == abs(refined_sigma), "sigma must be reported as a magnitude"
+
+
+def test_opposite_sigma_signs_give_the_same_verdict():
+    """The core invariant: +s and -s are the same pRF, so the fallback must not tell them apart."""
+    from gem.run.run_gem_prf_analysis import GEMpRFAnalysis
+
+    coarse = np.array([[0.2, 0.1, 1.1], [0.2, 0.1, 1.1]])
+    for magnitude in (0.4, 1.0, 1.3):
+        positive = np.array([[0.25, 0.15, magnitude], [0.25, 0.15, magnitude]])
+        negative = np.array([[0.25, 0.15, -magnitude], [0.25, 0.15, -magnitude]])
+
+        kept_pos, stats_pos, _ = GEMpRFAnalysis.apply_grid_fallback(positive, coarse, GRID_STEPS)
+        kept_neg, stats_neg, _ = GEMpRFAnalysis.apply_grid_fallback(negative, coarse, GRID_STEPS)
+
+        np.testing.assert_array_equal(kept_pos, kept_neg)
+        assert stats_pos == stats_neg
+
+
+def test_no_negative_sigma_survives_the_fallback():
+    """Whatever the verdict, a negative pRF size must never come out the other side."""
+    from gem.run.run_gem_prf_analysis import GEMpRFAnalysis
+
+    coarse = np.array([[0.2, 0.1, 1.1]] * 3)
+    refined = np.array([[0.2, 0.1, -0.05],      # near zero, kept
+                        [0.2, 0.1, -1.2],       # comparable to the grid point, kept
+                        [0.2, 0.1, -40.0]])     # genuinely far, reverted
+
+    kept, stats, _ = GEMpRFAnalysis.apply_grid_fallback(refined, coarse, GRID_STEPS)
+
+    assert (kept[:, 2] >= 0).all()
+    assert stats["sigma_too_far"] == 1
