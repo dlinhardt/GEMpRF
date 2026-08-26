@@ -28,6 +28,11 @@ class GemAnalysisTests(unittest.TestCase):
         self.data_dir = os.path.join(self.current_script_dir, "testdata", "simulated", "3n2")
 
         self.temp_dir = os.path.join(self.current_script_dir, "temp")
+        # NOTE: results go in a subdirectory, not next to the config. With overwrite="false" the
+        # pipeline backs up an existing results directory by moving it aside, and when that
+        # directory is temp/ itself the move takes the config -- and everything else tracked in
+        # temp/ -- along with it.
+        self.results_dir = os.path.join(self.temp_dir, "results")
         os.makedirs(self.temp_dir, exist_ok=True)
 
         # Base the test config on the current-schema template (carries the version the loader checks).
@@ -68,7 +73,7 @@ class GemAnalysisTests(unittest.TestCase):
         # results: plain JSON in the temp dir, filename == <input>_estimates.json
         results = root.find(".//fixed_paths/results")
         results.set("output_format", "json")
-        results.find("basepath").text = self.temp_dir
+        results.find("basepath").text = self.results_dir
         results.find("custom_filename_postfix").text = ""
         results.find("prepend_date").text = "False"
 
@@ -89,7 +94,7 @@ class GemAnalysisTests(unittest.TestCase):
         tree.write(self.config_path)
 
     def _result_json(self):
-        return os.path.join(self.temp_dir, "sub-001_ses-3n2_task-prf_acq-normal_run-01_estimates.json")
+        return os.path.join(self.results_dir, "sub-001_ses-3n2_task-prf_acq-normal_run-01_estimates.json")
 
     def test_results_match_benchmark(self):
         """Full run reproduces the pinned benchmark within 0.01 (regression / invariance guard)."""

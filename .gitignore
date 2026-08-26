@@ -64,3 +64,5 @@ build/
 .lprof
 .vscode
 .claude
+gem/tests/temp_backup*
+gem/tests/temp/

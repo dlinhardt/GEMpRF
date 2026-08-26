@@ -51,6 +51,16 @@ class GridFit:
         for i in range(num_batches):
             total_model_signals = total_model_signals + S_prime_cm_gpu_batches[i].shape[1] # i.e.  number of columns: bacuse each signal is present across a single column
 
+        # NOTE: with a single model-signal chunk that already lives on the default device there is
+        # nothing to assemble -- the product IS the error matrix. Allocating `out` and copying the
+        # chunk into it doubled the peak for exactly the configuration that can least afford it: one
+        # GPU, where that one chunk spans the whole grid and the copy is gigabytes.
+        if out is None and num_batches == 1 and S_prime_cm_gpu_batches[0].device.id == default_gpu_id:
+            with cp.cuda.Device(default_gpu_id):
+                e_gpu = cls.compute_error_term(Y_signals_gpu, S_prime_cm_gpu_batches[0])
+                e_gpu[cp.isinf(e_gpu) & (e_gpu > 0)] = -cp.inf # as in the per-chunk path below
+                return e_gpu
+
         with cp.cuda.Device(default_gpu_id):
             total_y_signals = Y_signals_gpu.shape[1]
             if out is None:
