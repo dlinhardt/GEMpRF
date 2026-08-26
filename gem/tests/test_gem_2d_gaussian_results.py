@@ -3,10 +3,25 @@
 These run the full pipeline through the real entry point ``gem.run(config_filepath)`` on a small
 fixed-paths (non-BIDS) config, then check the written estimates. Two guards:
 
-  1. results match the pinned benchmark within 0.01 -- a regression/invariance guard. On this clean
-     simulated pRF the refined-fit -> grid fallback should trigger on ~0 vertices, so the estimates
-     should still match the pre-change benchmark. If this fails, the fallback fired on the test data
-     (or a default changed): investigate before re-baselining the benchmark.
+  1. results match the pinned benchmark within 0.01 -- a regression/invariance guard. If this fails,
+     something moved: investigate before re-baselining, and if you do re-baseline, say here what
+     justified it.
+
+     The benchmark was re-pinned on 2026-08-26 for 0.2.0. The previous one dated from 2024-10-10 and
+     had drifted on 96.6% of vertices at full R2 -- not a regression, but the accumulation of
+     deliberate modelling changes made after it was recorded: nDCT became configurable, the HRF came
+     from config parameters, TR started being read from the NIfTI, the refine fit moved to the GPU,
+     and the grid fallback was added. The config template this test builds from did not even exist
+     at that commit, so the old file was comparing across a different pipeline rather than across
+     code changes. Nobody noticed for over a year because a `gem.run` name clash made this test die
+     with TypeError before it ever reached the comparison.
+
+     0.2.0 also changed the stored values themselves: estimates are no longer rounded to 4 decimals
+     and sigma is stored as a magnitude, so a benchmark from any earlier version cannot match.
+
+     Note the reduced coverage: `modelpred` is written as [None] in this configuration, and the
+     comparison only checks keys present in both files, so the predicted timecourses are no longer
+     guarded -- only the six fitted parameters.
   2. the recovered pRF centre/size averages to the simulated (3, 2, 1) -- robust to small numerical
      changes and independent of the benchmark.
 
@@ -105,7 +120,7 @@ class GemAnalysisTests(unittest.TestCase):
 
         benchmark = os.path.join(
             self.data_dir,
-            "2024-06-18_sub-001_ses-3n2_task-prf_acq-normal_run-01_estimates_[gem-benchmark_51x51x8].json")
+            "2026-08-26_sub-001_ses-3n2_task-prf_acq-normal_run-01_estimates_[gem-benchmark_51x51x8].json")
         new_results = EstimationsUtils.get_estimation_data(filepath=self._result_json())
         benchmark_results = EstimationsUtils.get_estimation_data(filepath=benchmark)
 
