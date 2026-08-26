@@ -117,6 +117,12 @@
 
   <!-- Measured data section -->
   <measured_data>
+    <!-- Number of vertex/voxel batches the fit is split into. The free GPU memory is measured before
+         fitting and this value is treated as an upper bound: if a batch of that size would not fit,
+         smaller batches are used instead of running out of memory.
+         Add auto="true" to let the measured memory choose the batch size in both directions, so
+         larger batches (fewer of them) are used when there is room. That is faster, but the batch
+         size then depends on the machine, so results can differ in the last bits between runs. -->
     <batches>500</batches>
   </measured_data>
 

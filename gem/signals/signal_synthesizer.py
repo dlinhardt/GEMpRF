@@ -108,17 +108,28 @@ class SignalSynthesizer:
     @classmethod
     def get_stimulus_data_on_selected_gpu(cls, stimulus : Stimulus, selected_device_id : int):
         # transfer stimulus data on the selected device, if the selecte device is not 0
-        if(ggm.get_instance().default_gpu_id != selected_device_id):
-            with cp.cuda.Device(selected_device_id):
-                stimulus_data_selected_gpu = cp.asarray(stimulus.stimulus_data_cpu)
-                stimulus_x_range = cp.asarray(stimulus.x_range_cpu)
-                stimulus_y_range = cp.asarray(stimulus.y_range_cpu)
-        else:
-            stimulus_data_selected_gpu = stimulus.stimulus_data_gpu
-            stimulus_x_range = stimulus.x_range_gpu
-            stimulus_y_range = stimulus.y_range_gpu
+        if(ggm.get_instance().default_gpu_id == selected_device_id):
+            return stimulus.stimulus_data_gpu, stimulus.x_range_gpu, stimulus.y_range_gpu
 
-        return stimulus_data_selected_gpu, stimulus_x_range, stimulus_y_range
+        # NOTE: cache the copy per device. This used to re-upload the whole stimulus on every call,
+        # and the refined-signal synthesis calls it twice per Y-batch, so the transferred volume grew
+        # with the batch count -- hundreds of GB per hemisphere, and worse the smaller the batches.
+        # The cache lives on the stimulus object so it is released with it, and each concatenated
+        # task keeps its own.
+        per_device_cache = getattr(stimulus, "_per_device_gpu_data", None)
+        if per_device_cache is None:
+            per_device_cache = {}
+            stimulus._per_device_gpu_data = per_device_cache
+
+        cached = per_device_cache.get(selected_device_id)
+        if cached is None:
+            with cp.cuda.Device(selected_device_id):
+                cached = (cp.asarray(stimulus.stimulus_data_cpu),
+                          cp.asarray(stimulus.x_range_cpu),
+                          cp.asarray(stimulus.y_range_cpu))
+            per_device_cache[selected_device_id] = cached
+
+        return cached
 
     @classmethod 
     def get_available_gpus(cls, total_model_signals, cfg):

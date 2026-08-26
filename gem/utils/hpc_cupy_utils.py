@@ -142,12 +142,11 @@ class HpcUtils:
         with cp.cuda.Device(device_id):    
 
             # get available memory in the already allocated mempool
-            free_mem_in_allocated_pool = 0
+            # NOTE: these three lines used to sit inside the `is None` branch, so every call after the
+            # first reported 0 here and the pool's reusable free blocks were counted as unavailable.
             if cls.gpu_memory_pool is None:
                 cls.gpu_memory_pool = cp.get_default_memory_pool()
-                total_mempool = cls.gpu_memory_pool.total_bytes()
-                used_mempool = cls.gpu_memory_pool.used_bytes()
-                free_mem_in_allocated_pool = total_mempool - used_mempool
+            free_mem_in_allocated_pool = cls.gpu_memory_pool.total_bytes() - cls.gpu_memory_pool.used_bytes()
 
             # get still available free memory on GPU
             available, total = cp.cuda.runtime.memGetInfo()
