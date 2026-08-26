@@ -23,9 +23,29 @@ class ResultFileWriter:
             cls.write_h5(base + '.h5', data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec,
                          grid_steps=grid_steps, grid_fallback_records=grid_fallback_records)
 
+    # JSON is a human-readable dump, so it gets rounded values; full float64 repr makes it
+    # unreadable and the file several times larger.
+    JSON_DECIMALS = 4
+
     @classmethod
     def write_json(cls, filepath, data):
-        JsonMgr.write_to_file(filepath, data)
+        """Serialise the estimates as JSON, rounded.
+
+        NOTE: the rounding belongs here and nowhere else. It used to live in
+        JsonMgr.args2jsonEntry() -- whose name reads as JSON-only -- but write_h5() unpacks the very
+        same dicts, so every HDF5 result was quantised to 1e-4 as well: pRF centres pinned to a
+        0.0001 deg lattice, in the format that is meant to be the precise one.
+        """
+        rounded = [{key: cls._rounded_value(value) for key, value in record.items()} for record in data]
+        JsonMgr.write_to_file(filepath, rounded)
+
+    @classmethod
+    def _rounded_value(cls, value):
+        if isinstance(value, list): # modelpred, a whole timecourse
+            return [round(float(element), cls.JSON_DECIMALS) for element in value]
+        if isinstance(value, (int, float, np.floating, np.integer)):
+            return round(float(value), cls.JSON_DECIMALS)
+        return value # None (modelpred omitted), strings, anything added later
 
     @classmethod
     def write_h5(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec, grid_steps=None, grid_fallback_records=None):

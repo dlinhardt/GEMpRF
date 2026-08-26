@@ -116,6 +116,40 @@ def test_grid_fit_helpers_match_dense_path():
     _assert_matches(_dense_path(e, de, neighbour_columns), vecs.reshape(vecs.shape[0], -1))
 
 
+def test_single_chunk_error_matrix_matches_the_assembled_path():
+    """One chunk on the default device is returned directly; the values must not change.
+
+    With a single GPU the whole grid is one chunk, so building a separate (num_y_signals,
+    num_model_signals) output and copying the product into it doubled the largest allocation of the
+    run for no gain. The short-circuit returns the product itself -- including the +inf -> -inf fold
+    the assembled path applies per chunk.
+    """
+    cp = pytest.importorskip("cupy", reason="needs a CUDA GPU")
+    from gem.fitting.hpc_grid_fit import GridFit
+    from gem.utils.gem_gpu_manager import GemGpuManager
+
+    if GemGpuManager.get_instance() is None:
+        GemGpuManager(default_gpu_id=0)
+    default_gpu_id = GemGpuManager.get_instance().default_gpu_id
+
+    rng = np.random.default_rng(23)
+    with cp.cuda.Device(default_gpu_id):
+        Y = cp.asarray(rng.normal(size=(31, NUM_Y_SIGNALS)))
+        S_prime = cp.asarray(rng.normal(size=(31, NUM_MODEL_SIGNALS)))
+        # a degenerate model signal, as orthonormalize_modelled_signals marks them
+        S_prime[:, 4] = cp.inf
+
+        short_circuit = GridFit.compute_error_matrix(Y, [S_prime])
+
+        # force the assembling path by handing it somewhere to assemble into
+        out = cp.zeros((NUM_Y_SIGNALS, NUM_MODEL_SIGNALS), dtype=cp.float64)
+        assembled = GridFit.compute_error_matrix(Y, [S_prime], out=out, accumulate=False)
+
+        np.testing.assert_array_equal(cp.asnumpy(short_circuit), cp.asnumpy(assembled))
+        # the degenerate column must score worst, not best
+        assert bool(cp.all(cp.isneginf(short_circuit[:, 4])))
+
+
 def test_error_matrix_accumulates_across_concatenated_runs():
     """Two runs added in place must equal the old stack-then-sum. Skipped without CuPy."""
     cp = pytest.importorskip("cupy", reason="needs a CUDA GPU")

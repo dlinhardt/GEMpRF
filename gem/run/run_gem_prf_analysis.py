@@ -206,13 +206,19 @@ class GEMpRFAnalysis:
                 dS_dtheta_batches_list.append(dS_dtheta_batches)
                 GemWriteToFile.get_instance().write_array_to_h5(dS_dtheta_batches, variable_path=[f'model', f'{subcat}', f'model_signals_derivative_d{theta_idx}'], append_to_existing_variable=False)
 
+        # Write debug info for the raw signals BEFORE orthonormalizing: the orthonormalization is
+        # allowed to release each raw batch as it consumes it (see release_inputs), which otherwise
+        # keeps the raw and the orthonormalized set alive side by side -- with three derivatives that
+        # is eight copies of the whole grid, and on a single GPU they all sit on the same card. The
+        # derivative batches are already written out per theta in the loop above.
+        GemWriteToFile.get_instance().write_array_to_h5(S_batches, variable_path=[f'model', f'{subcat}', 'model_signals'], append_to_existing_variable=False)
+
         # Orthonormalized model + derivatives signals
-        orthonormalized_S_cm_gpu_batches, orthonormalized_dervatives_signals_batches_list = SignalSynthesizer.orthonormalize_modelled_signals(O_gpu=O_gpu, 
-                                                                                                                                        model_signals_rm_batches= S_batches, 
-                                                                                                                                        dS_dtheta_rm_batches_list = dS_dtheta_batches_list)
-        # Write debug info
-        GemWriteToFile.get_instance().write_array_to_h5(S_batches, variable_path=[f'model', f'{subcat}', 'model_signals'], append_to_existing_variable=False)  
-        GemWriteToFile.get_instance().write_array_to_h5(orthonormalized_S_cm_gpu_batches, variable_path=[f'model', f'{subcat}', 'orthonormalized_model_signals'], append_to_existing_variable=False)  
+        orthonormalized_S_cm_gpu_batches, orthonormalized_dervatives_signals_batches_list = SignalSynthesizer.orthonormalize_modelled_signals(O_gpu=O_gpu,
+                                                                                                                                        model_signals_rm_batches= S_batches,
+                                                                                                                                        dS_dtheta_rm_batches_list = dS_dtheta_batches_list,
+                                                                                                                                        release_inputs = True)
+        GemWriteToFile.get_instance().write_array_to_h5(orthonormalized_S_cm_gpu_batches, variable_path=[f'model', f'{subcat}', 'orthonormalized_model_signals'], append_to_existing_variable=False)
         if orthonormalized_dervatives_signals_batches_list is not None:
             for theta_idx in range(len(orthonormalized_dervatives_signals_batches_list)):
                 GemWriteToFile.get_instance().write_array_to_h5(orthonormalized_dervatives_signals_batches_list[theta_idx], variable_path=[f'model', f'{subcat}', f'orthonormalized_model_signals_derivative_d{theta_idx}'], append_to_existing_variable=False)
@@ -605,6 +611,14 @@ class GEMpRFAnalysis:
             else:
                 valid_refined_prf_points_XY = np.concatenate((valid_refined_prf_points_XY, valid_refined_prf_points_XY_batch), axis = 0)                    
                 r2_results = np.concatenate((r2_results, r2_results_batch), axis = 0)            
+
+            # NOTE: release this batch's GPU arrays before the next iteration allocates its own. The
+            # error matrix is (batch_size, num_model_signals) float64 -- 6.6 GiB at batch_size=1137 on
+            # a 785k-point grid -- and `e` stayed bound across the loop boundary, so the next batch's
+            # matrix was built while the previous one was still resident. That is a third full copy on
+            # top of the two get_y_batch_size() budgets for, and it is what made <batches auto="true">
+            # run out of memory: the sizing was right, the accounting was not.
+            del e, best_fit_proj, Y_signals_batch_gpu
 
         grid_fallback_records = cls._finalize_fallback_records(fb_index_parts, fb_reason_parts, fb_refined_parts,
                                                                num_params=int(np.asarray(grid_steps).shape[0]))
