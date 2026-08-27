@@ -108,22 +108,58 @@ class SignalSynthesizer:
     @classmethod
     def get_stimulus_data_on_selected_gpu(cls, stimulus : Stimulus, selected_device_id : int):
         # transfer stimulus data on the selected device, if the selecte device is not 0
-        if(ggm.get_instance().default_gpu_id != selected_device_id):
+        if(ggm.get_instance().default_gpu_id == selected_device_id):
+            return stimulus.stimulus_data_gpu, stimulus.x_range_gpu, stimulus.y_range_gpu
+
+        # NOTE: cache the copy per device. This used to re-upload the whole stimulus on every call,
+        # and the refined-signal synthesis calls it twice per Y-batch, so the transferred volume grew
+        # with the batch count -- hundreds of GB per hemisphere, and worse the smaller the batches.
+        # The cache lives on the stimulus object so it is released with it, and each concatenated
+        # task keeps its own.
+        per_device_cache = getattr(stimulus, "_per_device_gpu_data", None)
+        if per_device_cache is None:
+            per_device_cache = {}
+            stimulus._per_device_gpu_data = per_device_cache
+
+        cached = per_device_cache.get(selected_device_id)
+        if cached is None:
             with cp.cuda.Device(selected_device_id):
-                stimulus_data_selected_gpu = cp.asarray(stimulus.stimulus_data_cpu)
-                stimulus_x_range = cp.asarray(stimulus.x_range_cpu)
-                stimulus_y_range = cp.asarray(stimulus.y_range_cpu)
-        else:
-            stimulus_data_selected_gpu = stimulus.stimulus_data_gpu
-            stimulus_x_range = stimulus.x_range_gpu
-            stimulus_y_range = stimulus.y_range_gpu
+                cached = (cp.asarray(stimulus.stimulus_data_cpu),
+                          cp.asarray(stimulus.x_range_cpu),
+                          cp.asarray(stimulus.y_range_cpu))
+            per_device_cache[selected_device_id] = cached
 
-        return stimulus_data_selected_gpu, stimulus_x_range, stimulus_y_range
+        return cached
 
-    @classmethod 
+    @classmethod
+    def downsample_frame_indices(cls, stimulus : Stimulus, stim_frames : int):
+        """Frame indices kept when a high-temporal-resolution stimulus is downsampled, or None.
+
+        They depend only on the stimulus -- not on the signals, and not on which chunk a signal was
+        synthesized in -- so they can be computed once up front and applied to each finished chunk.
+        """
+        if not stimulus.HighTemporalResolutionEnabled:
+            return None
+
+        if stim_frames < stimulus.NumFramesDownsampled: # i.e. if the number of frames in stimulus is less than the downsampled length
+            Logger.print_red_message(f"Number of frames in provided stimulus ({stim_frames}) is less than the specified downsampled length ({stimulus.NumFramesDownsampled}).\
+                                     \nPlease check your config file (high_temporal_resolution) and/or stimulus.", print_file_name=False)
+            sys.exit(1)
+
+        idx = np.linspace(0, stim_frames, stimulus.NumFramesDownsampled, endpoint=False, dtype=int)
+        slice_time_ref_adjusted_step_size = (np.diff(idx).mean() * stimulus.SliceTimeRef).round().astype(int)
+        return (idx + slice_time_ref_adjusted_step_size).astype(int)
+
+    @classmethod
     def get_available_gpus(cls, total_model_signals, cfg):
         if( total_model_signals > 1) & (gpu_utils.get_number_of_gpus() > 1):
-            available_gpus = list(map(int, os.environ["CUDA_VISIBLE_DEVICES"].split(',')))
+            # NOTE: CUDA_VISIBLE_DEVICES need not be set -- CuPy then sees every device. Reading it
+            # unguarded raised KeyError on a multi-GPU box that was simply started without it.
+            visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+            if visible_devices:
+                available_gpus = list(map(int, visible_devices.split(',')))
+            else:
+                available_gpus = list(range(gpu_utils.get_number_of_gpus()))
             num_gpus = len(available_gpus)
         else:
             # we don't need to use multiple GPUs for a single signal
@@ -151,6 +187,18 @@ class SignalSynthesizer:
         single_timecourse_length = stim_frames
         model_curve_length = stim_height * stim_width
 
+        # Every model signal is synthesized across the stimulus' full frame count -- the whole point
+        # of high_temporal_resolution is that the HRF-convolved stimulus and the model timecourses
+        # are formed on the fine time grid -- and only the finished signal is thinned out to the
+        # frames the scanner sampled.
+        # NOTE: that thinning now happens per chunk instead of once the whole per-GPU buffer had been
+        # filled. A chunk holds complete signals, so it is the same operation on the same finished
+        # timecourses; what changes is that only one chunk, rather than the entire buffer, is ever
+        # held at the full frame count. On a single GPU the buffer is the whole grid: 942k signals x
+        # 2400 frames = 18.1 GB had to be alive to produce 2.9 GB of downsampled signals.
+        downsampled_frame_indices = cls.downsample_frame_indices(stimulus, stim_frames)
+        output_timecourse_length = single_timecourse_length if downsampled_frame_indices is None else len(downsampled_frame_indices)
+
         # # total_signals = len(prf_space.multi_dim_points_cpu)             
         total_signals = len(prf_multi_dim_points_cpu)             
         per_signal_and_model_curve_required_mem_gb = ((single_timecourse_length + model_curve_length) * 8) / (1024 ** 3) # 8 bytes per float64
@@ -172,19 +220,25 @@ class SignalSynthesizer:
             with cp.cuda.Device(selected_gpu_id):  
                 # get stimulus data on the selected GPU
                 stimulus_data, stimulus_x_range, stimulus_y_range = SignalSynthesizer.get_stimulus_data_on_selected_gpu(stimulus = stimulus, selected_device_id = selected_gpu_id)                    
-                signal_rowmajor_batch_current_gpu = cp.zeros((min(per_gpu_assigned_batch_size, total_signals - num_signals_computed), single_timecourse_length), dtype=cp.float64)                                
+                signal_rowmajor_batch_current_gpu = cp.zeros((min(per_gpu_assigned_batch_size, total_signals - num_signals_computed), output_timecourse_length), dtype=cp.float64)
                                             
                 available_bytes = gpu_utils.device_available_mem_bytes(device_id=selected_gpu_id)                                
                 possible_batch_size = int((available_bytes / (1024 ** 3)) / (per_signal_and_model_curve_required_mem_gb * 1.2)) # additional "1.2" because, we will also be needing memory for the signal timecourses so, better be safe !!!
 
                 if possible_batch_size < 1 and num_gpus > 1: # if we have only 1 GPU, then usually the unified memory is used, so we can still compute the signals
-                    raise ValueError(f"Not enough GPU memory available on device-{selected_gpu_id}.\nAvailable (Gigabytes) = {available_bytes / (1024 ** 3)}, Required (Gigabytes) = {(per_signal_and_model_curve_required_mem_gb * 1.2) / (1024 ** 3)}.\nGEM-pRF cannot compute further model signals !!!")
-                
-                selected_gpu_possible_signals_chunk_size = per_gpu_assigned_batch_size if per_gpu_assigned_batch_size <= possible_batch_size else possible_batch_size 
+                    raise ValueError(f"Not enough GPU memory available on device-{selected_gpu_id}.\nAvailable (Gigabytes) = {available_bytes / (1024 ** 3)}, Required (Gigabytes) = {per_signal_and_model_curve_required_mem_gb * 1.2}.\nGEM-pRF cannot compute further model signals !!!")
+
+                selected_gpu_possible_signals_chunk_size = per_gpu_assigned_batch_size if per_gpu_assigned_batch_size <= possible_batch_size else possible_batch_size
                 selected_gpu_possible_signals_chunk_size = min(15000, selected_gpu_possible_signals_chunk_size) # Dirty fix, to avoid illegal memory access error, if the selected_gpu_possible_signals_chunk_size is too large
                 if selected_gpu_possible_signals_chunk_size < 1 and num_gpus == 1:
+                    # NOTE: the single-GPU fallback relies on unified memory, so it does not fail --
+                    # it silently drops to one kernel launch per signal, which for a dense grid means
+                    # the run never finishes. Say so rather than letting it look like a hang.
+                    Logger.print_red_message(f"Only {available_bytes / (1024 ** 3):.2f} GB free on device-{selected_gpu_id}, which is not enough for even one signal chunk "
+                                             f"({per_signal_and_model_curve_required_mem_gb * 1.2 * 1024:.1f} MB each). Falling back to one signal at a time via unified memory; "
+                                             f"expect this to be unusably slow for {total_signals} signals. Free GPU memory or use more GPUs.", print_file_name=False)
                     selected_gpu_possible_signals_chunk_size = 1
-                
+
                 for chunk_idx in range(0, per_gpu_assigned_batch_size, selected_gpu_possible_signals_chunk_size): # (0, total_sigma, batch_size)     
                     inprocess_signal_startidx = chunk_idx
                     if num_gpus == 1:
@@ -209,6 +263,10 @@ class SignalSynthesizer:
                         multi_dim_points_gpu=cp.asarray(multi_dim_points_cpu[full_range_signals_in_chunk_indices]),
                         num_dimension=prf_model.num_dimensions)
                     
+                    # the signal is complete at this point: downsample the finished timecourses
+                    if downsampled_frame_indices is not None:
+                        chunk_signal_rowmajor_batch_gpu = chunk_signal_rowmajor_batch_gpu[:, downsampled_frame_indices] # plt.plot(cp.asnumpy(signal_rowmajor_batch_current_gpu[0])[0, :])
+
                     # update to batch
                     try:
                         signal_rowmajor_batch_current_gpu[signals_in_chunk_indices, :] = chunk_signal_rowmajor_batch_gpu
@@ -216,17 +274,9 @@ class SignalSynthesizer:
                         print(f"{str(e)}.\nTry to reduce chunk size per GPU or contact the author siddharth.mittal@meduniwien.ac.at")
                         raise e
 
-                # Downsample the signals length in case of using high-res stimulus       
-                if stimulus.HighTemporalResolutionEnabled:                       
-                    if signal_rowmajor_batch_current_gpu.shape[1] < stimulus.NumFramesDownsampled: # i.e. if the number of frames in stimulus is less than the downsampled length
-                        Logger.print_red_message(f"Number of frames in provided stimulus ({signal_rowmajor_batch_current_gpu.shape[1]}) is less than the specified downsampled length ({stimulus.NumFramesDownsampled}).\
-                                                 \nPlease check your config file (high_temporal_resolution) and/or stimulus.", print_file_name=False)
-                        sys.exit(1)
-                    
-                    idx = np.linspace(0, signal_rowmajor_batch_current_gpu.shape[1], stimulus.NumFramesDownsampled, endpoint=False, dtype=int)
-                    slice_time_ref_adjusted_step_size = (np.diff(idx).mean() * stimulus.SliceTimeRef).round().astype(int)
-                    idx_adj = (idx + slice_time_ref_adjusted_step_size).astype(int)
-                    signal_rowmajor_batch_current_gpu = signal_rowmajor_batch_current_gpu[:, idx_adj] # plt.plot(cp.asnumpy(signal_rowmajor_batch_current_gpu[0])[0, :])
+                    # the full-resolution chunk is the transient this whole loop is sized around;
+                    # drop it before the next one is allocated
+                    del chunk_signal_rowmajor_batch_gpu
 
                 result_batches.append(signal_rowmajor_batch_current_gpu)
                 num_signals_computed += len(signal_rowmajor_batch_current_gpu)
@@ -234,8 +284,16 @@ class SignalSynthesizer:
         return result_batches
 
     @classmethod
-    def orthonormalize_modelled_signals(cls, O_gpu : cp.ndarray, model_signals_rm_batches : List[cp.ndarray], dS_dtheta_rm_batches_list : List[List[cp.ndarray]]) -> cp.ndarray:
-        # initialize 
+    def orthonormalize_modelled_signals(cls, O_gpu : cp.ndarray, model_signals_rm_batches : List[cp.ndarray], dS_dtheta_rm_batches_list : List[List[cp.ndarray]], release_inputs : bool = False) -> cp.ndarray:
+        """Orthonormalize the model signals and their derivatives, batch by batch.
+
+        ``release_inputs=True`` drops each raw batch as soon as its orthonormalized counterpart
+        exists, by clearing the caller's list entry. Without it both the raw and the orthonormalized
+        set are fully resident at the end -- eight copies of the grid with three derivatives, which
+        on a single GPU is the largest allocation of the run. Only pass it when the raw batches are
+        genuinely not needed afterwards (they are, for instance, still written out in debug mode).
+        """
+        # initialize
         #...S_prime_batches
         S_prime_batches = []
         #...the orthonormalized derivatives signals list
@@ -247,8 +305,10 @@ class SignalSynthesizer:
         for batch_idx in range(len(model_signals_rm_batches)):
             gpu_device_id = model_signals_rm_batches[batch_idx].device.id
             with cp.cuda.Device(gpu_device_id):  
-                O_gpu_current_device = O_gpu if gpu_device_id == ggm.get_instance().default_gpu_id else cp.array(O_gpu) 
+                O_gpu_current_device = O_gpu if gpu_device_id == ggm.get_instance().default_gpu_id else cp.array(O_gpu)
                 S_star_columnmajor_gpu = cp.dot(O_gpu_current_device, model_signals_rm_batches[batch_idx].T)
+                if release_inputs:
+                    model_signals_rm_batches[batch_idx] = None # the raw batch is not read again below
 
                 # need a take care the number of signals we have in the batch
                 if S_star_columnmajor_gpu.shape[1] > 1: # i.e. we have more than one signal
@@ -271,8 +331,30 @@ class SignalSynthesizer:
                 # orthogonalize: derivative signals                
                 for theta in range(num_theta_params):
                     dS_star_dtheta_batch_cm_gpu = cp.dot(O_gpu_current_device, (dS_dtheta_rm_batches_list[theta])[batch_idx].T)
-                    dS_prime_dtheta_batch_cm_gpu = dS_star_dtheta_batch_cm_gpu * S_star_S_star_invroot_gpu -  (S_star_columnmajor_gpu * (S_star_S_star_invroot_gpu ** 3)) * ((S_star_columnmajor_gpu * dS_star_dtheta_batch_cm_gpu).sum(axis=0))
-                    
+                    if release_inputs:
+                        (dS_dtheta_rm_batches_list[theta])[batch_idx] = None
+                    # NOTE: this is the same expression as before,
+                    #   dS'/dtheta = dS*/dtheta * n - (S* * n^3) * (S* . dS*/dtheta),
+                    # only evaluated so that no (num_timepoints, num_signals) array is allocated that
+                    # is not part of the answer. Written as one line it built four of them, two of
+                    # which existed only to be consumed by the very next operator; those two are now
+                    # folded into their predecessor in place. Each product is still formed in the
+                    # same order between the same operands, so every value is rounded exactly as
+                    # before -- what drops is the peak, from four such arrays to two.
+                    dS_prime_dtheta_batch_cm_gpu = dS_star_dtheta_batch_cm_gpu * S_star_S_star_invroot_gpu
+
+                    # (S* . dS*/dtheta) per column. dS*/dtheta is not read again after this, so it
+                    # doubles as the scratch space for the elementwise product that gets summed away
+                    # -- that product used to be a full array of its own.
+                    dS_star_dtheta_batch_cm_gpu *= S_star_columnmajor_gpu
+                    projection_gpu = dS_star_dtheta_batch_cm_gpu.sum(axis=0)
+                    del dS_star_dtheta_batch_cm_gpu
+
+                    correction_gpu = S_star_columnmajor_gpu * (S_star_S_star_invroot_gpu ** 3)
+                    correction_gpu *= projection_gpu # in place: same operands, same order, one array instead of two
+                    dS_prime_dtheta_batch_cm_gpu -= correction_gpu
+                    del correction_gpu
+
                     if orthonormalized_derivatives_signals_batches_list[theta] is None:
                         orthonormalized_derivatives_signals_batches_list[theta] = [dS_prime_dtheta_batch_cm_gpu]
                     else:

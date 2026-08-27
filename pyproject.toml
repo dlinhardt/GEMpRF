@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gemprf"
-version = "0.1.14"
+dynamic = ["version"] # read from gemprf/__init__.py, see [tool.setuptools.dynamic] below
 description = "A Python library for population receptive field (pRF) analysis"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -34,6 +34,12 @@ Homepage = "https://gemprf.github.io/"
 
 [tool.setuptools]
 include-package-data = true  # enable MANIFEST.in support otherwise package won't be .ptx, .cu, .xml, .h5 files
+
+[tool.setuptools.dynamic]
+# The version lives in the source, not here: init_setup enforces gemprf.__version__ against every
+# config file, so an installed copy whose metadata says something else would reject configs that the
+# repo itself accepts. Reading it from there keeps the two from drifting.
+version = { attr = "gemprf.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["gem*", "gemprf*"]

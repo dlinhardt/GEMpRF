@@ -59,3 +59,10 @@ codebase/gpu-simulation-grid-fitting/FastGridFittingApp/.vs/FastGridFittingApp/v
 dist/
 *.egg-info/
 build/
+
+# Ignore local stuff
+.lprof
+.vscode
+.claude
+gem/tests/temp_backup*
+gem/tests/temp/

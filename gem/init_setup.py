@@ -77,6 +77,9 @@ def manage_gpus(cfg, max_available_gpus):
 def run_selected_program(selected_program, config_filepath):
     cfg = GEMpRFAnalysis.load_config(config_filepath=config_filepath) # load default config
 
+    # [TIMING] lines stay quiet unless the config asks for debug info
+    Logger.enable_timing(cfg.write_debug_info)
+
     # NOTE: match versions
     config_file_version = cfg.config_data["@version"]
     if config_file_version != __version__:
@@ -117,10 +120,21 @@ def run_selected_program(selected_program, config_filepath):
             result_dir = os.path.join(cfg.bids.get("basepath"), "derivatives", "prfanalyze-gem", f'analysis-{analysis_id}')
         else:
             result_dir = cfg.fixed_paths['results']['basepath']
+        # NOTE: read the config before the backup move below. It can live *inside* result_dir --
+        # the test fixtures put it there, and so does anyone who keeps a config next to its own
+        # results -- and the move then carries it off with everything else, leaving the archival
+        # copy afterwards with nothing to read. That was a hard FileNotFoundError on the second and
+        # every later run, and it took the previous results directory with it on the way out.
+        config_basename = os.path.basename(config_filepath)
+        with open(config_filepath, "rb") as config_file:
+            config_contents = config_file.read()
+
         # "false" backs up the existing results dir; "true"/"skip" leave it in place
         if os.path.exists(result_dir) and cfg.overwrite_mode == "false":
             shutil.move(result_dir, f'{result_dir}_backup-{datetime.datetime.now():%Y%m%d-%H%M%S}')
-        shutil.copy(config_filepath, result_dir) if os.makedirs(result_dir, exist_ok=True) is None else None
+        os.makedirs(result_dir, exist_ok=True)
+        with open(os.path.join(result_dir, config_basename), "wb") as archived_config:
+            archived_config.write(config_contents)
         cfg.result_dir = result_dir
 
     # ...prf spatial points
@@ -142,8 +156,16 @@ def run_selected_program(selected_program, config_filepath):
         additional_dimensions = GEMpRFAnalysis.get_additional_dimensions(cfg, selected_prf_model)
         
     prf_space = PRFSpace(spatial_points_xy, additional_dimensions=additional_dimensions)
+
+    # build the full multi-dimensional grid (x, y, sigma)
+    _t0 = datetime.datetime.now()
     prf_space.convert_spatial_to_multidim()
+    Logger.print_timing_message(f"convert_spatial_to_multidim (build {len(spatial_points_xy)} xy x extra-dims grid): {datetime.datetime.now() - _t0}")
+
+    # keep only model-validated grid points
+    _t0 = datetime.datetime.now()
     prf_space.keep_validated_sampling_points(prf_model.get_validated_sampling_points_indices) # update the computed multi-dimensional points array
+    Logger.print_timing_message(f"keep_validated_sampling_points: {datetime.datetime.now() - _t0}")
 
     # NOTE
     _ = GemWriteToFile(result_dir = result_dir, debugging_enabled=cfg.write_debug_info) # initialize the GemWriteToFile singleton instance

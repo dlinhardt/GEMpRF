@@ -20,4 +20,7 @@ __all__ = ["run", "__version__"]
 def run(*args, **kwargs):
     return _gem.run(*args, **kwargs)
 
-__version__ = "0.1.14"
+# NOTE: this is the single source of truth for the version. init_setup enforces it against every
+# config file, and pyproject.toml reads it from here (dynamic version), so running straight from the
+# repo and running an installed copy can never disagree. Bumping it in one place is enough.
+__version__ = "0.2.0"

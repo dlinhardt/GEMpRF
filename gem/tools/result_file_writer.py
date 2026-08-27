@@ -14,20 +14,44 @@ class ResultFileWriter:
         return os.path.exists(base + '.h5') or os.path.exists(base + '.json')
 
     @classmethod
-    def write(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec):
+    def write(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec, grid_steps=None, grid_fallback_records=None):
         fmt = (cfg.results or {}).get('output_format', 'hdf5')
         base = os.path.splitext(filepath)[0]
         if fmt == 'json':
             cls.write_json(base + '.json', data)
         else:  # 'hdf5' or 'h5'
-            cls.write_h5(base + '.h5', data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec)
+            cls.write_h5(base + '.h5', data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec,
+                         grid_steps=grid_steps, grid_fallback_records=grid_fallback_records)
+
+    # JSON is a human-readable dump, so it gets rounded values; full float64 repr makes it
+    # unreadable and the file several times larger.
+    JSON_DECIMALS = 4
 
     @classmethod
     def write_json(cls, filepath, data):
-        JsonMgr.write_to_file(filepath, data)
+        """Serialise the estimates as JSON, rounded.
+
+        NOTE: the rounding belongs here and nowhere else. It used to live in the record builder,
+        back when that was called args2jsonEntry and read as JSON-only -- but write_h5() unpacks
+        the very same dicts, so every HDF5 result was quantised to 1e-4 as well: pRF centres
+        pinned to a 0.0001 deg lattice, in the format that is meant to be the precise one.
+        """
+        rounded = [{key: cls._rounded_value(value) for key, value in record.items()} for record in data]
+        JsonMgr.write_to_file(filepath, rounded)
 
     @classmethod
-    def write_h5(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec):
+    def _rounded_value(cls, value):
+        # NOTE: modelpred is a list, but not always a list of numbers. When the refined timecourses
+        # are not kept, format_in_json_format() fills it with np.array([None]).tolist() -- i.e.
+        # [None] -- so elements have to be checked individually, not just the container.
+        if isinstance(value, list): # modelpred, a whole timecourse
+            return [cls._rounded_value(element) for element in value]
+        if isinstance(value, (int, float, np.floating, np.integer)) and not isinstance(value, bool):
+            return round(float(value), cls.JSON_DECIMALS)
+        return value # None, strings, anything added later
+
+    @classmethod
+    def write_h5(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec, grid_steps=None, grid_fallback_records=None):
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
         # unpack list-of-dicts into arrays
@@ -70,6 +94,11 @@ class ResultFileWriter:
             sg.create_dataset('num_sigmas',          data=int(cfg.default_sigmas['num_sigmas']))
             sg.create_dataset('min_sigma',           data=float(cfg.default_sigmas['min_sigma']))
             sg.create_dataset('max_sigma',           data=float(cfg.default_sigmas['max_sigma']))
+            # per-dimension grid spacing (degrees); the refined-fit -> grid fallback uses 2x these
+            if grid_steps is not None:
+                sg.create_dataset('x_grid_step',     data=float(grid_steps[0]))
+                sg.create_dataset('y_grid_step',     data=float(grid_steps[1]))
+                sg.create_dataset('sigma_grid_step', data=float(grid_steps[2]))
 
             # --- metadata/stimulus ---
             stg = f.create_group('metadata/stimulus')
@@ -104,3 +133,41 @@ class ResultFileWriter:
             rg = f.create_group('metadata/run_info')
             rg.create_dataset('run_type',             data=str(run_type))
             rg.create_dataset('analysis_duration_sec', data=float(duration_sec))
+
+            # --- grid_fallback (per-vertex refined-fit rejection detail) ---
+            # Storage-efficient side table: only the rejected vertices are listed. The normal
+            # /parameters group is untouched (reverted vertices simply hold their grid point there),
+            # so this group is purely additive and ignored by readers that don't know about it.
+            cls._write_grid_fallback(f, grid_fallback_records)
+
+    @staticmethod
+    def _write_grid_fallback(f, records):
+        """Write the optional /grid_fallback group when there are rejected vertices to report.
+
+        ``records`` (from GEMpRFAnalysis._finalize_fallback_records) carries the flagged vertices
+        plus a self-describing reason legend, so nothing here needs to import the analysis module.
+        """
+        if not records:
+            return
+        vertex_index = np.asarray(records.get('vertex_index', []))
+        if vertex_index.size == 0:
+            return  # refine fitting off, or nothing was rejected -> no group at all
+
+        str_dt = h5py.special_dtype(vlen=str)
+
+        g = f.create_group('grid_fallback')
+        g.create_dataset('vertex_index',   data=vertex_index.astype(np.int32))
+        g.create_dataset('reason',         data=np.asarray(records['reason']).astype(np.uint8))
+        g.create_dataset('refined_params', data=np.asarray(records['refined_params']).astype(np.float32))
+
+        # legend so `reason` decodes without any external doc. Stored purely as datasets (visible in
+        # every h5 explorer) -- NOT as group attributes, which some explorers hide.
+        reason_bits = records.get('reason_bits', {})
+        param_columns = str(records.get('param_columns', 'Centerx0,Centery0,sigmaMajor'))
+        if reason_bits:
+            ordered = sorted(reason_bits.items(), key=lambda kv: kv[1])
+            legend = ', '.join(f'{int(bit)}={name}' for name, bit in ordered)
+            g.create_dataset('reason_legend',      data=str(legend))
+            g.create_dataset('reason_bit_names',   data=np.array([n for n, _ in ordered], dtype=str_dt))
+            g.create_dataset('reason_bit_values',  data=np.array([int(b) for _, b in ordered], dtype=np.uint8))
+        g.create_dataset('param_columns',          data=str(param_columns))

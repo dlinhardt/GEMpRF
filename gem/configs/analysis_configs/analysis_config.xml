@@ -1,11 +1,11 @@
 <!-- XML representation of JSON data -->
-<!-- 
+<!--
     "@Author  :   Siddharth Mittal",
     "@Version :   1.0",
     "@Contact :   siddharth.mittal@meduniwien.ac.at",
     "@License :   (C)Copyright 2024 - 2025, Medical University of Vienna"
 -->
-<root version="0.1.14">
+<root version="0.2.0">
   <!-- Path information -->
   <path_to_append>.../</path_to_append>
   <refine_fitting enable="True" refinefit_on_gpu="True"/> <!-- Execute refine fitting on GPU if sufficient GPU memory is available -->
@@ -17,28 +17,28 @@
     <visual_field>9</visual_field> <!-- Visual field Radius, NOTE: Use "10" for simulated data, else "9" -->
     <width>101</width>
     <height>101</height>
-    <binarization enable="False" threshold="0"/> <!-- stimulus will be binarized if enabled, all values above threshold will be set to 1 and below to 0 -->	
-    
+    <binarization enable="False" threshold="0"/> <!-- stimulus will be binarized if enabled, all values above threshold will be set to 1 and below to 0 -->
+
     <!-- Compute model signals with high-res stimulus then downsample: "num_frames_downsampled" = your fMRI timecourse length, "slice_time_ref" for details see https://www.alivelearn.net/?p=1037 -->
     <high_temporal_resolution enable="false" num_frames_downsampled="240" slice_time_ref="0.5"/>
   </stimulus>
 
   <!-- Input Data -->
-  <input_datasrc>    
+  <input_datasrc>
     <BIDS enable="True" run_type="individual" comment="options are individual/concatenated"> <!-- Set to "True" if the input data is organized in BIDS format, select "individual" or "concatenated" run type -->
       <basepath>/ceph/mri.meduniwien.ac.at/projects/physics/fmri/data/stimsim24/</basepath>
       <append_to_basepath>derivatives, fmriprep</append_to_basepath>
-      
+
       <!-- Directory name for results.
            overwrite: "false" = back up any existing results dir to <dir>_backup-<timestamp> before running;
                       "true"  = write into the existing dir, overwriting colliding result files;
                       "skip"  = leave existing results untouched and skip inputs whose result (.h5 or .json) already exists. -->
       <results_anaylsis_id overwrite="False">GEMpRF</results_anaylsis_id>
-            
-      <!-- 
+
+      <!--
         NOTE: Case sensitive, provide the exact values!!!
         For the analysis, sub, ses, task, run, hemi,
-        either provide comma separated values or specify "all" (to go through every available analysis) 
+        either provide comma separated values or specify "all" (to go through every available analysis)
         Sample: <analysis>01, 02</analysis> or <analysis>all</analysis>
       -->
       <analysis>01</analysis>
@@ -49,8 +49,8 @@
 
       <!--INDIVIDUAL Task/stimulus Analysis-->
       <individual>
-        <task>bar</task> <!--name of the stimulus, this will be used to find the file in the stimulus directory, ONLY one value is allowed-->  
-        <ses>all</ses> <!-- comma separated values or specify "all" -->        
+        <task>bar</task> <!--name of the stimulus, this will be used to find the file in the stimulus directory, ONLY one value is allowed-->
+        <ses>all</ses> <!-- comma separated values or specify "all" -->
         <run>all</run> <!-- comma separated values or specify "all" -->
       </individual>
 
@@ -66,19 +66,19 @@
           <task>bar</task>
           <run>04</run>
         </concatenate_item>
-      </concatenated>       
+      </concatenated>
     </BIDS>
 
     <!--OR, make Bids False and specify directly single/multiple filepaths -->
     <fixed_paths>
 
       <stimulus_filepath>/path/to/your/stimulus_file.nii.gz</stimulus_filepath>
-    
-      <measured_data_filepath comment="Add one or more measured-data filepaths here. Use a separate filepath block for each entry.">      
+
+      <measured_data_filepath comment="Add one or more measured-data filepaths here. Use a separate filepath block for each entry.">
         <filepath>/path/to/sub-XXX/ses-YYY/func/sub-XXX_ses-YYY_task-XYZ_run-01_bold.nii.gz</filepath>
         <filepath>/path/to/sub-XXX/ses-YYY/func/sub-XXX_ses-YYY_task-XYZ_run-02_bold.nii.gz</filepath>
         <!-- <filepath>/optional/example/of/more_files.nii.gz</filepath> -->
-      </measured_data_filepath>              
+      </measured_data_filepath>
 
       <!-- output_format: "hdf5" (default) saves parameters + full metadata as HDF5; "json" saves a flat list of per-voxel dicts as JSON -->
       <results output_format="hdf5">
@@ -91,12 +91,12 @@
         <!-- If True, the current date is prepended to all results filenames -->
         <prepend_date>False</prepend_date>
       </results>
-    
+
     </fixed_paths>
   </input_datasrc>
 
   <!-- Analysis Model -->
-  <pRF_model>    
+  <pRF_model>
     <model>2d_gaussian</model> <!-- 2d_gaussian, (DoG, CSS not avaiable at the moment) -->
   </pRF_model>
 
@@ -104,7 +104,13 @@
   <measured_data>
     <width>101</width>
     <height>101</height>
-    <batches>500</batches>    
+    <!-- Number of vertex/voxel batches the fit is split into. The free GPU memory is measured before
+         fitting and this value is treated as an upper bound: if a batch of that size would not fit,
+         smaller batches are used instead of running out of memory.
+         Add auto="true" to let the measured memory choose the batch size in both directions, so
+         larger batches (fewer of them) are used when there is room. That is faster, but the batch
+         size then depends on the machine, so results can differ in the last bits between runs. -->
+    <batches>500</batches>
   </measured_data>
 
   <!-- GPU configuration -->
@@ -120,14 +126,14 @@
   </gpu>
 
   <!-- Search space information -->
-  <search_space write_debug_info="false">    
+  <search_space write_debug_info="false">
     <!-- if the user wants to use custom HRF, pRF sizes or Spatial grid, provide the filepath to the H5 file and the keys for each parameter -->
     <optional_analysis_params enable="False" filepath="DIR_PATH/analysis_additional_params.h5">
       <hrf use_from_file="True" key="analysis_params/hrf_values"/>
       <sigmas use_from_file="True" key="analysis_params/sigmas"/>
       <spatial_grid_xy use_from_file="True" key="analysis_params/spatial_grid_xy"/>
     </optional_analysis_params>
-    
+
     <!-- if the user wants to generate a rectilinear grid within the GEM-pRF program, specify the default values below. Please NOTE that these values will ONLY be used if their corresponding optional_analysis_params = False -->
     <default_hrf t="(0, 45)" TR="auto" peak_delay="6.16" under_shoot_delay="12.0" peak_disp="0.85" under_disp="0.82" peak_to_undershoot="2.15" normalize="true"/> <!-- SPM parameters, "t" is fed to np.arange(start, stop, step), "step" represents the TR value, set it to a lower value in case of high temporal stimulus. If TR = "auto" then, its value will be read from the stimulus file -->
     <default_spatial_grid visual_field_radius="13.5" num_horizontal_prfs="151" num_vertical_prfs="151"/>

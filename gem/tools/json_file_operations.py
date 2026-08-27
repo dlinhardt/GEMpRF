@@ -22,14 +22,29 @@ class JsonMgr:
 
 
     @classmethod
-    def args2jsonEntry(cls, muX, muY, sigma, r2, signal):        
+    def args2estimate_record(cls, muX, muY, sigma, r2, signal):
+        """Build the one estimate record both writers (JSON and HDF5) unpack.
+
+        Named for what it is, not for one of its consumers: ResultFileWriter.write_h5() unpacks
+        exactly these dicts too. It used to be called args2jsonEntry, which is why the rounding
+        ended up in here -- and therefore quantised every HDF5 result to 1e-4, far coarser than
+        the float32 the datasets hold. Values are kept at full precision; only write_json rounds.
+
+        NOTE: sigma is stored as a magnitude. The Gaussian is even in sigma -- it enters as
+        exp(-r^2 / 2*sigma^2) -- so +s and -s describe the identical pRF and nothing constrains the
+        refined fit to the positive branch; it lands on whichever side the quadratic surrogate puts
+        it. The sign is therefore meaningless, but it used to reach the results file, where a
+        negative pRF size is simply wrong: anything downstream that averages or thresholds on sigma
+        silently mis-handles those vertices. Measured on the 5000-vertex 3n2 test data, 10 of them
+        came out negative.
+        """
         json_entry = {
-                    "Centerx0": round(float(muX), 4),
-                    "Centery0": round(float(muY), 4),
+                    "Centerx0": float(muX),
+                    "Centery0": float(muY),
                     "Theta": 0,
-                    "sigmaMajor": round(float(sigma), 4),
+                    "sigmaMajor": abs(float(sigma)),
                     "sigmaMinor": 0,
-                    "R2": round(float(r2), 4),
+                    "R2": float(r2),
                     "modelpred": signal.tolist()
                 }
         return json_entry
