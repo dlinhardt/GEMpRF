@@ -31,13 +31,28 @@ from gem.utils.gem_gpu_manager import GemGpuManager as ggm
 DEBUG = False
 
 class SignalSynthesizer:
+    # CUDA allows at most 65535 blocks along the y dimension of a grid. The kernels stride over
+    # blockIdx.y, so a chunk with more curves than this is covered in several passes.
+    MAX_GRID_DIM_Y = 65535
+
     @classmethod
-    def __set_kernel_config(self, num_xThreads : int, num_yThreads : int, num_zThreads : int):
-        block_dim = (512, 1, 1)
-        bx = int((num_xThreads + block_dim[0] - 1) / block_dim[0])
-        by = int((num_yThreads + block_dim[1] - 1) / block_dim[1])
-        bz = int((num_zThreads + block_dim[2] - 1) / block_dim[2])
-        grid_dim = (bx, by, bz)
+    def __set_kernel_config(cls, num_model_curves : int, num_pixels : int):
+        """Block and grid for the model-curve kernels: threads along pixels, blocks along curves.
+
+        This used to launch one thread per pRF point (`num_xThreads = num_model_curves`, blocks of
+        512), which for a 15,000-curve chunk is ceil(15000/512) = 30 blocks -- fewer blocks than a
+        V100 has SMs, leaving five eighths of the device idle, with far too few resident warps to
+        hide memory latency. Each thread then walked its entire curve, so lanes within a warp wrote
+        addresses `num_pixels` doubles apart and every store became its own memory transaction.
+
+        Mapping consecutive threads to consecutive pixels instead makes the writes coalesced and
+        gives the launch ceil(num_pixels / 256) x num_curves blocks, which fills the device. The
+        arithmetic per output element is unchanged, so the model curves are identical.
+        """
+        block_dim = (256, 1, 1)
+        blocks_over_pixels = max(1, (num_pixels + block_dim[0] - 1) // block_dim[0])
+        blocks_over_curves = max(1, min(num_model_curves, cls.MAX_GRID_DIM_Y))
+        grid_dim = (blocks_over_pixels, blocks_over_curves, 1)
         return block_dim, grid_dim
 
     """Compute the model curves (Gaussian curves, DoG curves, etc.) based on the selected PRF model"""
@@ -62,7 +77,8 @@ class SignalSynthesizer:
         flattened_points_gpu = multi_dim_points_gpu.ravel()
 
         # call the CUDA kernel
-        block_dim, grid_dim = SignalSynthesizer.__set_kernel_config(num_xThreads=num_model_curves, num_yThreads=1, num_zThreads=1)
+        block_dim, grid_dim = SignalSynthesizer.__set_kernel_config(num_model_curves=num_model_curves,
+                                                                    num_pixels=stimulus_height * stimulus_width)
         cuda_kernel(grid_dim, block_dim,
                     (result_model_curves_gpu,
                      flattened_points_gpu,
