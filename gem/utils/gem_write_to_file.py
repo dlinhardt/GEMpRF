@@ -28,6 +28,9 @@ class GemWriteToFile:
     def __initialize(self, result_dir, debugging_enabled):
         self.__result_dir = result_dir
         self.__debugging_enabled = debugging_enabled
+        # The first write of a run truncates the debug file instead of adding to whatever the
+        # previous run left there -- see __create_dataset for why appending to it is not free.
+        self.__debug_file_started = False
 
     @classmethod
     def get_instance(cls):
@@ -95,8 +98,16 @@ class GemWriteToFile:
         if np.issubdtype(data_to_write.dtype, np.str_) or np.issubdtype(data_to_write.dtype, np.object_):
             data_to_write = np.array(data_to_write, dtype=h5py.string_dtype(encoding='utf-8'))
 
-        # Open HDF5 file
-        with h5py.File(filepath, "a") as f:
+        # Open HDF5 file. The first write of a run truncates: every dataset this writer produces is
+        # rewritten from scratch each run, so carrying the previous run's copy forward only costs
+        # space. NOTE: this makes two runs writing into the same result_dir at the same time
+        # mutually destructive -- they already were, since they overwrite each other's datasets.
+        file_mode = "a"
+        if not self.__debug_file_started:
+            file_mode = "w"
+            self.__debug_file_started = True
+
+        with h5py.File(filepath, file_mode) as f:
             if variable_path_str in f:
                 dset = f[variable_path_str]
                 if append_to_existing_variable:
@@ -116,8 +127,30 @@ class GemWriteToFile:
                     dset[-data_to_write.shape[0]:] = data_to_write
                 else:
                     del f[variable_path_str]
-                    maxshape = (None,) + data_to_write.shape[1:] if data_to_write.ndim > 1 else (None,)
-                    f.create_dataset(variable_path_str, data=data_to_write, maxshape=maxshape)
+                    self.__create_dataset(f, variable_path_str, data_to_write, append_to_existing_variable)
             else:
-                maxshape = (None,) + data_to_write.shape[1:] if data_to_write.ndim > 1 else (None,)
-                f.create_dataset(variable_path_str, data=data_to_write, maxshape=maxshape)
+                self.__create_dataset(f, variable_path_str, data_to_write, append_to_existing_variable)
+
+    @staticmethod
+    def __create_dataset(f, variable_path_str, data_to_write, resizable):
+        """Create the dataset, extendable only if something is actually going to extend it.
+
+        Passing ``maxshape=`` forces chunked storage -- ~12,000 chunks per 2.9 GB array for the
+        whole-grid signals. When such a dataset was deleted and rewritten, the freed chunks were
+        never picked up again: the default file space strategy does not persist free space across a
+        close, and this writer opens and closes the file once per dataset. The result was that
+        **every run stranded its predecessor's data in full**. Measured against the pre-change
+        writer, five runs of identical datasets into one directory grew the file 5.00x, exactly
+        linearly, and alternating two dataset sizes grew it 10.98x. On the server that produced a
+        99.33 GB debug_model_data.h5 holding 28 GB of live datasets, its first 71.29 GB one
+        contiguous unreferenced region that h5stat reported as 0 bytes of tracked free space.
+
+        A dataset created without ``maxshape`` is contiguous, allocated as a single block, and is
+        reused cleanly. Nothing currently passes append_to_existing_variable=True, so in practice
+        every dataset takes the contiguous path; the resizable branch stays for that caller's sake.
+        """
+        if resizable:
+            maxshape = (None,) + data_to_write.shape[1:] if data_to_write.ndim > 1 else (None,)
+            f.create_dataset(variable_path_str, data=data_to_write, maxshape=maxshape)
+        else:
+            f.create_dataset(variable_path_str, data=data_to_write)
