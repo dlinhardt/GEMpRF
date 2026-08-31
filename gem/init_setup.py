@@ -30,6 +30,7 @@ from gem.utils.gem_write_to_file import GemWriteToFile
 from gem.utils.logger import Logger
 from gem.utils.gem_h5_file_handler import H5FileManager
 from gem.utils.run_report import RunReport
+from gem.utils.cpu_budget import apply_numba_thread_budget, available_cpus
 
 # gemprf wrapper import
 from gemprf import __version__
@@ -79,6 +80,12 @@ def run_selected_program(selected_program, config_filepath):
 
     # [TIMING] lines stay quiet unless the config asks for debug info
     Logger.enable_timing(cfg.write_debug_info)
+
+    # Cap the CPU-parallel work at half the available cores. run_gem.py already set the BLAS
+    # env vars (they only take effect before numpy loads); this covers numba's prange pool, which
+    # can still be lowered at runtime, for callers that reach here through `import gem; gem.run(...)`.
+    cpu_threads = apply_numba_thread_budget()
+    Logger.print_timing_message(f"CPU thread budget: {cpu_threads} of {available_cpus()} available")
 
     # NOTE: match versions
     config_file_version = cfg.config_data["@version"]

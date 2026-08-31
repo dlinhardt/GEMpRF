@@ -14,6 +14,15 @@ import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# Cap the CPU thread pools BEFORE anything imports numpy/scipy/numba: OpenMP, MKL and OpenBLAS read
+# their thread counts once, when the library loads, so this is the only point at which it can be set.
+# See gem/utils/cpu_budget.py for why one process takes half the cores rather than all of them.
+try:
+    from gem.utils.cpu_budget import apply_thread_budget_env
+except ImportError:
+    from utils.cpu_budget import apply_thread_budget_env
+apply_thread_budget_env()
+
 import argparse
 
 def run(config_filepath=None):
