@@ -23,4 +23,4 @@ def run(*args, **kwargs):
 # NOTE: this is the single source of truth for the version. init_setup enforces it against every
 # config file, and pyproject.toml reads it from here (dynamic version), so running straight from the
 # repo and running an installed copy can never disagree. Bumping it in one place is enough.
-__version__ = "0.2.0"
+__version__ = "0.2.1"
