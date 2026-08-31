@@ -28,6 +28,16 @@ class RunReport:
         self.skipped = []     # list of result filepaths
         self.failed = []      # list of (input_desc, error_type, message, traceback_str)
         self.grid_fallbacks = []  # list of (input_desc, stats_dict) for refined -> grid reverts
+        self.setup_timings = {}   # phase name -> seconds, for the once-per-run work before any file
+        self.phase_totals = {}    # phase name -> seconds, summed over every analysis (debug runs only)
+
+    # Readable names for the setup phases, in the order they run.
+    SETUP_PHASE_LABELS = (
+        ("stimulus_sec", "stimulus + HRF"),
+        ("model_signals_sec", "model signals"),
+        ("mpinv_sec", "M-inverse thread"),
+        ("refine_tables_sec", "refine lookup tables"),
+    )
 
     # ------------------------------------------------------------------ counts
     @property
@@ -60,6 +70,27 @@ class RunReport:
             tb = ""
         self.failed.append((input_desc, type(exc).__name__, str(exc), tb))
 
+    def set_setup_timing(self, **phases):
+        """Record how long a once-per-run setup phase took, in seconds.
+
+        Setup -- stimulus load and HRF convolution, model-signal synthesis, the M-inverse thread,
+        the refinement's lookup tables -- runs before any file is fitted and is excluded from the
+        per-analysis durations, so without this a run that spends ten minutes before its first fit
+        is indistinguishable from one that starts immediately.
+        """
+        for name, seconds in phases.items():
+            if seconds is not None:
+                self.setup_timings[name] = float(seconds)
+
+    def add_phase_timings(self, totals):
+        """Sum one analysis' per-phase fit timings into the run-level totals.
+
+        Only populated when write_debug_info is on -- see PhaseTimer, which needs a device
+        synchronise at every phase boundary for the numbers to mean anything.
+        """
+        for name, seconds in (totals or {}).items():
+            self.phase_totals[name] = self.phase_totals.get(name, 0.0) + float(seconds)
+
     def add_grid_fallback(self, input_desc, stats):
         # stats: dict with keys total, on_grid, worse_error, x_too_far, y_too_far,
         #        sigma_too_far, nan_refined, zero_signal
@@ -84,6 +115,30 @@ class RunReport:
             f"  skipped      : {self.num_skipped} (result already exists)",
             f"  failed       : {self.num_failed}",
         ]
+
+        if self.setup_timings:
+            title = "Setup (once per run, NOT included in the per-analysis durations below)"
+            lines += ["", title, "-" * len(title)]
+            known = [(key, label) for key, label in self.SETUP_PHASE_LABELS if key in self.setup_timings]
+            for key, label in known:
+                lines.append(f"  {label:<22}: {datetime.timedelta(seconds=round(self.setup_timings[key]))}")
+            total_setup = sum(self.setup_timings[key] for key, _ in known)
+            lines.append(f"  {'total':<22}: {datetime.timedelta(seconds=round(total_setup))}")
+
+        if self.phase_totals:
+            title = "Fit phases (summed over every analysis)"
+            lines += ["", title, "-" * len(title)]
+            measured = sum(self.phase_totals.values())
+            for name, seconds in sorted(self.phase_totals.items(), key=lambda kv: kv[1], reverse=True):
+                share = 100 * seconds / measured if measured else 0.0
+                lines.append(f"  {name:<22}: {datetime.timedelta(seconds=round(seconds))}  ({share:.0f}%)")
+            lines.append(f"  {'measured total':<22}: {datetime.timedelta(seconds=round(measured))}")
+
+        if self.completed:
+            title = f"Completed ({self.num_completed})"
+            lines += ["", title, "-" * len(title)]
+            for input_desc, duration_sec in self.completed:
+                lines.append(f"  {datetime.timedelta(seconds=round(duration_sec))}  {input_desc}")
 
         if self.skipped:
             lines += ["", f"Skipped ({self.num_skipped})", "-" * len(f"Skipped ({self.num_skipped})")]

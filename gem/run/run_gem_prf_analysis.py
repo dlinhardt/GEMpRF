@@ -53,6 +53,7 @@ from gem.tools.result_file_writer import ResultFileWriter
 from gem.utils.gem_gpu_manager import GemGpuManager as ggm
 from gem.utils.logger import Logger
 from gem.utils.gem_errors import TimepointMismatchError, InputFileMissingError
+from gem.utils.phase_timer import PhaseTimer
 from gem.utils.gem_h5_file_handler import H5FileManager
 from gem.signals.hrf_generator import spm_hrf_compat
 
@@ -511,9 +512,10 @@ class GEMpRFAnalysis:
         return batch_size
 
     @classmethod
-    def get_pRF_estimations(cls, cfg, O_gpu, prf_space, prf_model, stimulus, prf_analysis, arr_2d_location_inv_M_cpu, measured_data_filepath):
+    def get_pRF_estimations(cls, cfg, O_gpu, prf_space, prf_model, stimulus, prf_analysis, arr_2d_location_inv_M_cpu, measured_data_filepath, timer=None):
         valid_refined_prf_points_XY = None
         r2_results = None
+        timer = timer if timer is not None else PhaseTimer(enabled=False)
 
         # per-dimension grid spacing (cached on prf_space) and per-run fallback counters
         grid_steps = prf_space.get_grid_steps()
@@ -539,38 +541,39 @@ class GEMpRFAnalysis:
         batch_size = cls.get_y_batch_size(cfg, total_y_signals, len(prf_space.multi_dim_points_cpu))
         for current_batch_idx in range(0, total_y_signals, batch_size):
             Y_signals_batch_gpu = ggm.get_instance().execute_cupy_func_on_default(cp.asarray, cupy_func_args=(Y_signals_cpu[:, current_batch_idx: current_batch_idx + batch_size],))
-            Y_signals_batch_cpu = Y_signals_cpu[:, current_batch_idx: current_batch_idx + batch_size]
 
             # error: grid search over every model signal. The derivative error terms are NOT computed
             # here -- they are only read at the neighbourhood of the winner, which is not known until
             # the argmax below has run (see GridFit).
             isResultOnGPU = ((cfg.is_refinefit_on_gpu & cfg.refine_fitting_enabled) | (not cfg.refine_fitting_enabled))
-            best_fit_proj, e = GridFit.get_error_terms(isResultOnGPU=isResultOnGPU,
-                                                       Y_signals_gpu=Y_signals_batch_gpu,
-                                                       S_prime_cm_batches_gpu=prf_analysis.orthonormalized_S_batches)
+            with timer.phase("grid search"):
+                best_fit_proj, e = GridFit.get_error_terms(isResultOnGPU=isResultOnGPU,
+                                                           Y_signals_gpu=Y_signals_batch_gpu,
+                                                           S_prime_cm_batches_gpu=prf_analysis.orthonormalized_S_batches)
 
             # Logger.print_green_message(f"error computed for batch {current_batch_idx} - {current_batch_idx + min(batch_size, total_y_signals-current_batch_idx) }...", print_file_name=False)
 
             # NOTE: RefineFit produces results in (X, Y) format
             # perform refine search, the obtained refined results will be in the (X, Y) format
             if cfg.refine_fitting_enabled:
-                num_Y_signals = Y_signals_batch_cpu.shape[1]
                 # evaluate e and de/dtheta straight into the (num_Y_signals, max_neighbours) shape the
                 # refinement reads, instead of over the whole grid
-                neighbour_columns = RefineFit.get_neighbour_columns(prf_space, best_fit_proj, arr_2d_location_inv_M_cpu)
-                e_neighbour_terms = GridFit.gather_neighbour_terms(e, neighbour_columns)
-                de_neighbour_terms = GridFit.accumulate_derivative_neighbour_terms(Y_signals_batch_gpu,
-                                                                                   prf_analysis.orthonormalized_dS_dtheta_batches_list,
-                                                                                   neighbour_columns)
-                refine_input_vecs = GridFit.build_refine_input_vectors(e_neighbour_terms, de_neighbour_terms, isResultOnGPU)
-                del e_neighbour_terms, de_neighbour_terms
+                with timer.phase("neighbour columns"):
+                    neighbour_columns = RefineFit.get_neighbour_columns(prf_space, best_fit_proj, arr_2d_location_inv_M_cpu)
+                with timer.phase("derivative gather"):
+                    e_neighbour_terms = GridFit.gather_neighbour_terms(e, neighbour_columns)
+                    de_neighbour_terms = GridFit.accumulate_derivative_neighbour_terms(Y_signals_batch_gpu,
+                                                                                       prf_analysis.orthonormalized_dS_dtheta_batches_list,
+                                                                                       neighbour_columns)
+                    refine_input_vecs = GridFit.build_refine_input_vectors(e_neighbour_terms, de_neighbour_terms, isResultOnGPU)
+                    del e_neighbour_terms, de_neighbour_terms
 
-                refined_matching_results_XY, Fex_results = RefineFit.get_refined_fit_results(prf_space,
-                                                                                             num_Y_signals,
-                                                                                             best_fit_proj,
-                                                                                             arr_2d_location_inv_M_cpu,
-                                                                                             refine_input_vecs,
-                                                                                             neighbour_columns)
+                with timer.phase("refine solve"):
+                    refined_matching_results_XY = RefineFit.get_refined_fit_results(prf_space,
+                                                                                    best_fit_proj,
+                                                                                    arr_2d_location_inv_M_cpu,
+                                                                                    refine_input_vecs,
+                                                                                    neighbour_columns)
                 del refine_input_vecs
         
             # NOTE: The coarse_estimation values are in XY format (i.e. (col, row) format)
@@ -579,16 +582,17 @@ class GEMpRFAnalysis:
             # validate if the refined pRF estimations are really improving the error value, and for the pRF points where error is getting worse, keep the coarse pRF estimations
             batch_fallback_records = None
             if cfg.refine_fitting_enabled:
-                valid_refined_prf_points_XY_batch, batch_fallback_stats, batch_fallback_records = GEMpRFAnalysis.get_valid_refined_data(refined_matching_results_XY,
-                                                                                          Y_signals_gpu=Y_signals_batch_gpu,
-                                                                                          O_gpu=O_gpu,
-                                                                                          prf_model=prf_model,
-                                                                                          stimulus=stimulus,
-                                                                                          coarse_e=e,
-                                                                                          best_fit_proj=best_fit_proj,
-                                                                                          coarse_pRF_estimations=coarse_pRF_estimations,
-                                                                                          cfg=cfg,
-                                                                                          grid_steps=grid_steps)
+                with timer.phase("fallback validation"):
+                    valid_refined_prf_points_XY_batch, batch_fallback_stats, batch_fallback_records = GEMpRFAnalysis.get_valid_refined_data(refined_matching_results_XY,
+                                                                                              Y_signals_gpu=Y_signals_batch_gpu,
+                                                                                              O_gpu=O_gpu,
+                                                                                              prf_model=prf_model,
+                                                                                              stimulus=stimulus,
+                                                                                              coarse_e=e,
+                                                                                              best_fit_proj=best_fit_proj,
+                                                                                              coarse_pRF_estimations=coarse_pRF_estimations,
+                                                                                              cfg=cfg,
+                                                                                              grid_steps=grid_steps)
                 for key in grid_fallback_stats:
                     grid_fallback_stats[key] += batch_fallback_stats[key]
             else:
@@ -596,10 +600,12 @@ class GEMpRFAnalysis:
                 grid_fallback_stats["total"] += int(coarse_pRF_estimations.shape[0])
 
             # compute timecourses for refined pRF estimated params
-            valid_refined_S_cpu_batch = GEMpRFAnalysis.get_refined_signals_cpu(valid_refined_prf_points_XY_batch, prf_model, stimulus, cfg)
+            with timer.phase("refined signals"):
+                valid_refined_S_cpu_batch = GEMpRFAnalysis.get_refined_signals_cpu(valid_refined_prf_points_XY_batch, prf_model, stimulus, cfg)
 
             # compute Variance Explained
-            r2_results_batch = R2.get_r2_num_den_method_with_epsilon_as_yTs(Y_signals_batch_gpu, O_gpu, valid_refined_prf_points_XY_batch, valid_refined_S_cpu_batch).reshape(-1, 1)
+            with timer.phase("R2"):
+                r2_results_batch = R2.get_r2_num_den_method_with_epsilon_as_yTs(Y_signals_batch_gpu, O_gpu, valid_refined_prf_points_XY_batch, valid_refined_S_cpu_batch).reshape(-1, 1)
 
             # zero-signal vertices are flagged by R2 with the -2 sentinel (see prf_r2_variance_explain);
             # count them for the report without any extra signal scan.
@@ -724,6 +730,10 @@ class GEMpRFAnalysis:
                     task_specific_data_dict[stimulus_task_name] = task_specific_data
                     # task_specific_data_dict[stimulus_task] = (stimulus, O_gpu, prf_analysis)
             
+        # Same as in individual_run: release the synthesis transients before the fit starts asking
+        # for its large contiguous error matrices.
+        gpu_utils.release_pool_on_all_devices()
+
         # get M-inverse matrix
         if arr_2d_location_inv_M_cpu is None:
             join_start_time = datetime.datetime.now()
@@ -731,6 +741,17 @@ class GEMpRFAnalysis:
             if not result_queue.empty():
                 arr_2d_location_inv_M_cpu = result_queue.get()
             Logger.print_timing_message(f"M-inverse thread: {datetime.datetime.now() - mpinv_thread_start_time} total, of which {datetime.datetime.now() - join_start_time} spent waiting after the GPU work")
+            report.set_setup_timing(mpinv_sec=(datetime.datetime.now() - mpinv_thread_start_time).total_seconds())
+
+            # build the refinement's padded lookup tables here rather than lazily inside the first
+            # concatenation block, whose timer would otherwise absorb the whole one-time cost.
+            # NOTE: unlike individual_run, the M-inverse thread above is started unconditionally
+            # here, so the tables have to be guarded on the refinement actually being enabled.
+            if cfg.refine_fitting_enabled:
+                _t_prepare = datetime.datetime.now()
+                RefineFit.prepare(arr_2d_location_inv_M_cpu, prf_space)
+                report.set_setup_timing(refine_tables_sec=(datetime.datetime.now() - _t_prepare).total_seconds())
+                Logger.print_timing_message(f"RefineFit padded tables: {datetime.datetime.now() - _t_prepare}")
 
         # NOTE: Process each Concatenation Block
         class YSignalsInfo:
@@ -748,9 +769,12 @@ class GEMpRFAnalysis:
             counter += 1
             start_time = time.time()
             try:
+                timer = PhaseTimer(enabled=cfg.write_debug_info)
                 block_fallback_stats = cls._process_concatenation_block(cfg, prf_model, prf_space, concatenate_block_info, task_specific_data_dict,
                                                  arr_2d_location_inv_M_cpu, refinefit_on_gpu, default_gpu_id, YSignalsInfo,
-                                                 counter, len(required_concatenations_info), start_time)
+                                                 counter, len(required_concatenations_info), start_time, timer=timer)
+                timer.report()
+                report.add_phase_timings(timer.totals)
             except Exception as exc:
                 Logger.print_red_message(f"Analysis FAILED for {concatenate_block_info.concatenation_result_filepath}: {exc}", print_file_name=False)
                 report.add_failed(concatenate_block_info.concatenation_result_filepath, exc)
@@ -767,7 +791,7 @@ class GEMpRFAnalysis:
     @classmethod
     def _process_concatenation_block(cls, cfg, prf_model, prf_space, concatenate_block_info, task_specific_data_dict,
                                      arr_2d_location_inv_M_cpu, refinefit_on_gpu, default_gpu_id, YSignalsInfo,
-                                     counter, num_concatenation_blocks, start_time):
+                                     counter, num_concatenation_blocks, start_time, timer=None):
         """Run a single concatenation block. Raises on failure; the caller records it in the run report.
 
         Returns ``(block_fallback_stats, block_fallback_records)``: the per-block grid-fallback stats
@@ -778,7 +802,8 @@ class GEMpRFAnalysis:
         synthesised; the worse-error and zero-signal reasons are not evaluated on this path
         (reported as 0).
         """
-        json_data = None
+        estimate_parts, r2_parts = [], []
+        timer = timer if timer is not None else PhaseTimer(enabled=False)
         grid_steps = prf_space.get_grid_steps()
         block_fallback_stats = {key: 0 for key in ("total", "worse_error", "nan_refined",
                                                    "x_too_far", "y_too_far", "sigma_too_far",
@@ -824,10 +849,11 @@ class GEMpRFAnalysis:
                 Y_signals_batch_cpu = (arr_Y_signals_cpu[concat_item_idx].Y_signals_cpu)[:, current_batch_idx: current_batch_idx + batch_size]
                 num_Y_signals_in_batch = Y_signals_batch_cpu.shape[1] # this is just the number of Y-signals in the current batch, it is independent of the task-name
                 current_data_task = arr_Y_signals_cpu[concat_item_idx].task_name
-                concatenated_e = GridFit.compute_error_matrix(Y_signals_gpu=Y_signals_batch_gpu,
-                                                              S_prime_cm_gpu_batches=task_specific_data_dict[current_data_task].prf_analysis.orthonormalized_S_batches,
-                                                              out=concatenated_e,
-                                                              accumulate=concatenated_e is not None)
+                with timer.phase("grid search"):
+                    concatenated_e = GridFit.compute_error_matrix(Y_signals_gpu=Y_signals_batch_gpu,
+                                                                  S_prime_cm_gpu_batches=task_specific_data_dict[current_data_task].prf_analysis.orthonormalized_S_batches,
+                                                                  out=concatenated_e,
+                                                                  accumulate=concatenated_e is not None)
 
             # current Y-BATCH concatenated best fit.
             # NOTE: the index array has to live on the same side as multi_dim_points_[cpu|gpu] below,
@@ -845,28 +871,30 @@ class GEMpRFAnalysis:
             if cfg.refine_fitting_enabled:
                 # gather e at the neighbourhood of each winner, then release the full matrix before
                 # the derivative terms are evaluated into the same small shape
-                neighbour_columns = RefineFit.get_neighbour_columns(prf_space, best_fit_proj, arr_2d_location_inv_M_cpu)
-                e_neighbour_terms = GridFit.gather_neighbour_terms(concatenated_e, neighbour_columns)
-                del concatenated_e
+                with timer.phase("neighbour columns"):
+                    neighbour_columns = RefineFit.get_neighbour_columns(prf_space, best_fit_proj, arr_2d_location_inv_M_cpu)
+                with timer.phase("derivative gather"):
+                    e_neighbour_terms = GridFit.gather_neighbour_terms(concatenated_e, neighbour_columns)
+                    del concatenated_e
 
-                de_neighbour_terms = None
-                for concat_item_idx in range(num_concatenation_items):
-                    current_data_task = arr_Y_signals_cpu[concat_item_idx].task_name
-                    de_neighbour_terms = GridFit.accumulate_derivative_neighbour_terms(
-                        Y_signals_gpu=Y_signals_batch_gpu_list[concat_item_idx],
-                        dS_prime_dtheta_cm_gpu_batches_list=task_specific_data_dict[current_data_task].prf_analysis.orthonormalized_dS_dtheta_batches_list,
-                        neighbour_columns=neighbour_columns,
-                        out=de_neighbour_terms)
+                    de_neighbour_terms = None
+                    for concat_item_idx in range(num_concatenation_items):
+                        current_data_task = arr_Y_signals_cpu[concat_item_idx].task_name
+                        de_neighbour_terms = GridFit.accumulate_derivative_neighbour_terms(
+                            Y_signals_gpu=Y_signals_batch_gpu_list[concat_item_idx],
+                            dS_prime_dtheta_cm_gpu_batches_list=task_specific_data_dict[current_data_task].prf_analysis.orthonormalized_dS_dtheta_batches_list,
+                            neighbour_columns=neighbour_columns,
+                            out=de_neighbour_terms)
 
-                refine_input_vecs = GridFit.build_refine_input_vectors(e_neighbour_terms, de_neighbour_terms, refinefit_on_gpu)
-                del e_neighbour_terms, de_neighbour_terms
+                    refine_input_vecs = GridFit.build_refine_input_vectors(e_neighbour_terms, de_neighbour_terms, refinefit_on_gpu)
+                    del e_neighbour_terms, de_neighbour_terms
 
-                refined_matching_results_XY, _ = RefineFit.get_refined_fit_results(prf_space=prf_space,
-                                                                                num_Y_signals=num_Y_signals_in_batch,
-                                                                                best_fit_proj=best_fit_proj,
-                                                                                arr_2d_location_inv_M_cpu=arr_2d_location_inv_M_cpu,
-                                                                                refine_input_vecs=refine_input_vecs,
-                                                                                neighbour_columns=neighbour_columns)
+                with timer.phase("refine solve"):
+                    refined_matching_results_XY = RefineFit.get_refined_fit_results(prf_space=prf_space,
+                                                                                    best_fit_proj=best_fit_proj,
+                                                                                    arr_2d_location_inv_M_cpu=arr_2d_location_inv_M_cpu,
+                                                                                    refine_input_vecs=refine_input_vecs,
+                                                                                    neighbour_columns=neighbour_columns)
                 del refine_input_vecs
                 # parameter-based fallback (nan / too-far) applied before signal synthesis,
                 # so reverted vertices get the correct grid-point timecourse below.
@@ -925,11 +953,8 @@ class GEMpRFAnalysis:
             r2_numerator_term = cp.sum(numerators_gpu, axis=0)
             r2_inverse_term = (cp.sum(denominators_gpu, axis=0)) ** (-1)
             r2_result_batch = cp.where(r2_numerator_term>0, 1 - r2_numerator_term * r2_inverse_term, r2_numerator_term) 
-            batch_json_data = R2.format_in_json_format(r2_result_batch, valid_refined_prf_points_XY_batch, None, refined_signals_present=False)
-            if json_data is None:
-                json_data = batch_json_data
-            else:
-                json_data += batch_json_data
+            estimate_parts.append(np.asarray(cp.asnumpy(valid_refined_prf_points_XY_batch)))
+            r2_parts.append(np.asarray(cp.asnumpy(r2_result_batch)).ravel())
 
             # print ("Refined fitting done...")
 
@@ -939,7 +964,8 @@ class GEMpRFAnalysis:
         # Write the full results of the current concatenation block to file
         ResultFileWriter.write(
             filepath=concatenate_block_info.concatenation_result_filepath,
-            data=json_data,
+            params_xy=np.concatenate(estimate_parts, axis=0),
+            r2=np.concatenate(r2_parts),
             cfg=cfg,
             input_filepaths=concatenate_block_info.filepaths_to_be_concatenated,
             stimulus_filepath=cfg.stimulus.get('directory', cfg.stimulus.get('filepath', '')),
@@ -976,11 +1002,13 @@ class GEMpRFAnalysis:
         GemWriteToFile.get_instance().write_array_to_h5(np.array(measured_data_list), variable_path=['input_data', 'measured_data_list'], append_to_existing_variable=False)
 
         # stimulus
+        _t_stimulus = time.time()
         if cfg.bids['@enable'] == "True":
             stimulus_info = GemBidsHandler.get_stimulus_info(stimulus_dir = cfg.stimulus['directory'], stimulus_name = cfg.bids['individual']['task'])
         else:
             stimulus_info = GemBidsHandler.get_non_bids_stimulus_info(cfg)
         stimulus = GEMpRFAnalysis.load_stimulus(cfg, stimulus_info)
+        report.set_setup_timing(stimulus_sec=time.time() - _t_stimulus)
 
         # M-Matrix
         if cfg.refine_fitting_enabled:
@@ -997,12 +1025,18 @@ class GEMpRFAnalysis:
 
 
         #...compute Model Signals
-        prf_analysis = PRFAnalysis(prf_space=prf_space, stimulus=stimulus) # to hold all the information about this analysis run,  # NOTE: PRFAnalysis class will be helpful for the concatenation runs, where you can store the results with different stimulus in corresponding objects (i.e. prf_analysis)                              
-        prf_analysis.orthonormalized_S_batches, prf_analysis.orthonormalized_dS_dtheta_batches_list = cls.compute_orthonormalized_signals(O_gpu=O_gpu, 
-                                                                                                                                    prf_space= prf_space, 
-                                                                                                                                    prf_model= prf_model, 
+        _t_model_signals = time.time()
+        prf_analysis = PRFAnalysis(prf_space=prf_space, stimulus=stimulus) # to hold all the information about this analysis run,  # NOTE: PRFAnalysis class will be helpful for the concatenation runs, where you can store the results with different stimulus in corresponding objects (i.e. prf_analysis)
+        prf_analysis.orthonormalized_S_batches, prf_analysis.orthonormalized_dS_dtheta_batches_list = cls.compute_orthonormalized_signals(O_gpu=O_gpu,
+                                                                                                                                    prf_space= prf_space,
+                                                                                                                                    prf_model= prf_model,
                                                                                                                                     stimulus= stimulus,
-                                                                                                                                    cfg = cfg)  
+                                                                                                                                    cfg = cfg)
+        report.set_setup_timing(model_signals_sec=time.time() - _t_model_signals)
+        # Synthesis reserves far more pool than the fit keeps (a 15k model-curve chunk is 10.1 GiB at
+        # 301x301). Give those blocks back now, or the pool holds ~98% of the card in fragments and
+        # the first error matrix fails to allocate while free memory still reads in the tens of GB.
+        gpu_utils.release_pool_on_all_devices()
         Logger.print_green_message("model signals computed...", print_file_name=False)
 
         #...get M-inverse matrix
@@ -1015,6 +1049,14 @@ class GEMpRFAnalysis:
             # the thread runs concurrently with the GPU work above, so the join only measures
             # what is left of it; the thread's own wall time is the number to compare across runs.
             Logger.print_green_message(f"Time taken to compute M-inverse matrix: {datetime.datetime.now() - mpinv_thread_start_time} (of which {datetime.datetime.now() - inv_mat_join_start_time} waiting after the GPU work)\n", print_file_name=False)
+            report.set_setup_timing(mpinv_sec=(datetime.datetime.now() - mpinv_thread_start_time).total_seconds())
+
+            # build the refinement's padded lookup tables here rather than lazily inside the first
+            # file, whose timer would otherwise absorb the whole one-time cost
+            _t_prepare = datetime.datetime.now()
+            RefineFit.prepare(arr_2d_location_inv_M_cpu, prf_space)
+            report.set_setup_timing(refine_tables_sec=(datetime.datetime.now() - _t_prepare).total_seconds())
+            Logger.print_timing_message(f"RefineFit padded tables: {datetime.datetime.now() - _t_prepare}")
 
         # # end time
         # end_time = time.time()
@@ -1048,22 +1090,24 @@ class GEMpRFAnalysis:
             file_processed_counter += 1
 
             try:
-                valid_refined_prf_points_XY, r2_results, grid_fallback_stats, grid_fallback_records = GEMpRFAnalysis.get_pRF_estimations(cfg, O_gpu, prf_space, prf_model, stimulus, prf_analysis, arr_2d_location_inv_M_cpu, measured_data_filepath)
+                timer = PhaseTimer(enabled=cfg.write_debug_info)
+                valid_refined_prf_points_XY, r2_results, grid_fallback_stats, grid_fallback_records = GEMpRFAnalysis.get_pRF_estimations(cfg, O_gpu, prf_space, prf_model, stimulus, prf_analysis, arr_2d_location_inv_M_cpu, measured_data_filepath, timer=timer)
                 # profiler.disable()
                 # stats = pstats.Stats(profiler, stream=profile_stream)
                 # stats.strip_dirs().sort_stats("cumulative").print_stats(20)  # Top 20 most time-consuming calls
                 # print(profile_stream.getvalue())
 
 
-                # format results to JSON
-                # NOTE: to print the refined signals in the JSON file, re-add the per-batch
-                # accumulation of valid_refined_S_cpu in get_pRF_estimations() and pass it here.
-                json_data = R2.format_in_json_format( r2_results, valid_refined_prf_points_XY, None, refined_signals_present=False)
-
-                # write results to file
+                # write results to file.
+                # NOTE: to store the refined timecourses too, re-add the per-batch accumulation of
+                # valid_refined_S_cpu in get_pRF_estimations() and pass it as modelpred=.
+                _t_write = time.time()
+                # ResultFileWriter is deliberately numpy-only (it must not import anything that pulls
+                # in cupy), and these come back on the device whenever the refinement ran on the GPU.
                 ResultFileWriter.write(
                     filepath=result_filepaths_list[data_idx],
-                    data=json_data,
+                    params_xy=cp.asnumpy(valid_refined_prf_points_XY),
+                    r2=cp.asnumpy(r2_results),
                     cfg=cfg,
                     input_filepaths=[measured_data_filepath],
                     stimulus_filepath=os.path.join(stimulus_info.stimulus_dir, stimulus_info.stimulus_filename),
@@ -1072,6 +1116,9 @@ class GEMpRFAnalysis:
                     grid_steps=grid_steps,
                     grid_fallback_records=grid_fallback_records,
                 )
+                timer.add("result write", time.time() - _t_write)
+                timer.report()
+                report.add_phase_timings(timer.totals)
             except Exception as exc:
                 Logger.print_red_message(f"Analysis FAILED for {measured_data_filepath}: {exc}", print_file_name=False)
                 report.add_failed(measured_data_filepath, exc)
