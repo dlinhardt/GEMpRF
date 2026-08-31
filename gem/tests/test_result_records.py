@@ -112,7 +112,7 @@ def test_json_writer_handles_a_missing_modelpred(tmp_path):
 def test_json_writer_handles_a_none_inside_the_modelpred_list(tmp_path):
     """The real shape of a dropped timecourse is [None], not None.
 
-    format_in_json_format() writes np.array([None]).tolist() when the refined signals are not kept,
+    build_estimate_records() writes np.array([None]).tolist() when the refined signals are not kept,
     so the container is a list and only its elements are None. Checking the container alone let
     float(None) through and killed the whole analysis -- but only on the JSON path, because write_h5
     tests modelpred_list[0] and skips the dataset entirely.
@@ -136,3 +136,111 @@ def test_json_writer_rounds_a_real_modelpred(tmp_path):
 
     assert written == [round(PRECISE_X, ResultFileWriter.JSON_DECIMALS), None,
                        round(PRECISE_R2, ResultFileWriter.JSON_DECIMALS)]
+
+
+# --------------------------------------------------------------------------------------
+# The HDF5 writer takes arrays; only the JSON writer sees per-vertex dicts
+# --------------------------------------------------------------------------------------
+
+def _stub_cfg():
+    """The minimum ResultFileWriter.write_h5 reads off a config."""
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        results={'output_format': 'hdf5'},
+        pRF_model_details={'model': '2d_gaussian'},
+        refine_fitting_enabled=True,
+        nDCT=3,
+        write_debug_info=False,
+        default_spatial_grid={'visual_field_radius': 15, 'num_horizontal_prfs': 201, 'num_vertical_prfs': 201},
+        default_sigmas={'num_sigmas': 30, 'min_sigma': 0.1, 'max_sigma': 5},
+        stimulus={'visual_field': 10, 'width': 301, 'height': 301,
+                  'binarization': {'@enable': 'False', '@threshold': 0}},
+        default_hrf={'TR': None, 't': (0.0, 45.0), 'peak_delay': 6.16, 'under_shoot_delay': 12.0,
+                     'peak_disp': 1.0, 'under_disp': 1.0, 'peak_to_undershoot': 6.0, 'normalize': True},
+    )
+
+
+def test_h5_writer_stores_the_fit_arrays_unchanged():
+    """write_h5 reads columns straight off the fit's arrays -- no dict round trip in between."""
+    h5py = pytest.importorskip("h5py")
+    import tempfile
+
+    params_xy = np.array([[1.5, -2.5, 0.75], [-0.125, 3.25, 2.5], [0.0, 0.0, 0.1]])
+    r2 = np.array([0.9, 0.4, -2.0])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "sub-01", "estimates.h5")
+        ResultFileWriter.write_h5(path, params_xy, r2, _stub_cfg(), ["/in.nii.gz"], "/stim", "individual", 12.5)
+        with h5py.File(path, "r") as f:
+            np.testing.assert_array_equal(f["parameters/Centerx0"][...], params_xy[:, 0].astype(np.float32))
+            np.testing.assert_array_equal(f["parameters/Centery0"][...], params_xy[:, 1].astype(np.float32))
+            np.testing.assert_array_equal(f["parameters/sigmaMajor"][...], params_xy[:, 2].astype(np.float32))
+            np.testing.assert_array_equal(f["parameters/R2"][...], r2.astype(np.float32))
+            # isotropic Gaussian: the two placeholder fields exist so both formats describe the same thing
+            assert not f["parameters/Theta"][...].any()
+            assert not f["parameters/sigmaMinor"][...].any()
+            assert "modelpred" not in f["parameters"]
+
+
+def test_h5_writer_stores_sigma_as_a_magnitude():
+    """apply_grid_fallback normalises the sign, but the writer must not depend on that having run."""
+    h5py = pytest.importorskip("h5py")
+    import tempfile
+
+    params_xy = np.array([[1.0, 1.0, -0.75], [1.0, 1.0, 0.75]])
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "estimates.h5")
+        ResultFileWriter.write_h5(path, params_xy, np.array([0.5, 0.5]), _stub_cfg(),
+                                  ["/in.nii.gz"], "/stim", "individual", 1.0)
+        with h5py.File(path, "r") as f:
+            sigma = f["parameters/sigmaMajor"][...]
+    assert sigma[0] == sigma[1] == np.float32(0.75), sigma
+
+
+def test_h5_and_json_describe_the_same_vertex():
+    """The two formats diverge in representation only -- the values behind them must agree."""
+    h5py = pytest.importorskip("h5py")
+    import tempfile
+
+    params_xy = np.array([[PRECISE_X, PRECISE_Y, -PRECISE_SIGMA]])
+    r2 = np.array([PRECISE_R2])
+    records = ResultFileWriter.build_estimate_records(params_xy, r2)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "estimates.h5")
+        ResultFileWriter.write_h5(path, params_xy, r2, _stub_cfg(), ["/in.nii.gz"], "/stim", "individual", 1.0)
+        with h5py.File(path, "r") as f:
+            assert f["parameters/Centerx0"][0] == np.float32(records[0]["Centerx0"])
+            assert f["parameters/sigmaMajor"][0] == np.float32(records[0]["sigmaMajor"])
+            assert f["parameters/R2"][0] == np.float32(records[0]["R2"])
+
+
+@pytest.mark.parametrize("output_format,extension", [("hdf5", ".h5"), ("json", ".json")])
+def test_write_dispatches_on_the_configured_format(output_format, extension):
+    """write() is the only entry point the pipeline uses; both branches must accept the fit's arrays.
+
+    The JSON branch is where the per-vertex dicts get built -- the HDF5 branch never sees them. This
+    is the seam that broke once already: write() takes host arrays, and the fit hands back CuPy ones
+    whenever refinement ran on the GPU, so the conversion belongs at the call site.
+    """
+    import tempfile
+
+    cfg = _stub_cfg()
+    cfg.results = {'output_format': output_format}
+    params_xy = np.array([[1.5, -2.5, -0.75], [0.25, 0.5, 1.25]])
+    r2 = np.array([0.9, 0.4])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = os.path.join(tmp, "sub-01", "estimates")
+        ResultFileWriter.write(filepath=base + ".h5", params_xy=params_xy, r2=r2, cfg=cfg,
+                               input_filepaths=["/in.nii.gz"], stimulus_filepath="/stim",
+                               run_type="individual", duration_sec=1.0)
+        written = base + extension
+        assert os.path.exists(written), f"{output_format} branch wrote nothing at {written}"
+        assert ResultFileWriter.result_exists(written)
+
+        if output_format == "json":
+            with open(written) as handle:
+                records = json.load(handle)
+            assert len(records) == 2
+            assert records[0]["sigmaMajor"] == 0.75  # magnitude, rounded for JSON

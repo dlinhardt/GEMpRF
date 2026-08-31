@@ -14,14 +14,40 @@ class ResultFileWriter:
         return os.path.exists(base + '.h5') or os.path.exists(base + '.json')
 
     @classmethod
-    def write(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec, grid_steps=None, grid_fallback_records=None):
+    def write(cls, filepath, params_xy, r2, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec,
+              modelpred=None, grid_steps=None, grid_fallback_records=None):
+        """Write one analysis result in whichever format the config asked for.
+
+        ``params_xy`` is (num_vertices, 3) -- Centerx0, Centery0, sigma -- and ``r2`` is (num_vertices,).
+        Both must be **host** arrays: this module stays free of anything that imports cupy, so the
+        callers convert (the fit leaves them on the device whenever refinement ran on the GPU).
+
+        The per-vertex dict records exist only to be serialised as JSON, so they are built in that
+        branch alone: HDF5 stores columns, and turning the arrays into 141k dicts just to take them
+        apart again was both slower and the wrong layering.
+        """
         fmt = (cfg.results or {}).get('output_format', 'hdf5')
         base = os.path.splitext(filepath)[0]
         if fmt == 'json':
-            cls.write_json(base + '.json', data)
+            cls.write_json(base + '.json', cls.build_estimate_records(params_xy, r2, modelpred))
         else:  # 'hdf5' or 'h5'
-            cls.write_h5(base + '.h5', data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec,
-                         grid_steps=grid_steps, grid_fallback_records=grid_fallback_records)
+            cls.write_h5(base + '.h5', params_xy, r2, cfg, input_filepaths, stimulus_filepath, run_type,
+                         duration_sec, modelpred=modelpred, grid_steps=grid_steps,
+                         grid_fallback_records=grid_fallback_records)
+
+    @classmethod
+    def build_estimate_records(cls, params_xy, r2, modelpred=None):
+        """One dict per vertex, for the JSON writer only.
+
+        Kept going through JsonMgr.args2estimate_record so the record shape stays defined in exactly
+        one place (sigma as a magnitude, full precision, the Theta/sigmaMinor placeholders).
+        """
+        params_xy = np.asarray(params_xy)
+        r2 = np.asarray(r2).ravel()
+        no_signal = np.array([None])
+        return [JsonMgr.args2estimate_record(params_xy[i, 0], params_xy[i, 1], params_xy[i, 2], r2[i],
+                                             no_signal if modelpred is None else modelpred[i])
+                for i in range(params_xy.shape[0])]
 
     # JSON is a human-readable dump, so it gets rounded values; full float64 repr makes it
     # unreadable and the file several times larger.
@@ -42,7 +68,7 @@ class ResultFileWriter:
     @classmethod
     def _rounded_value(cls, value):
         # NOTE: modelpred is a list, but not always a list of numbers. When the refined timecourses
-        # are not kept, format_in_json_format() fills it with np.array([None]).tolist() -- i.e.
+        # are not kept, build_estimate_records() fills it with np.array([None]).tolist() -- i.e.
         # [None] -- so elements have to be checked individually, not just the container.
         if isinstance(value, list): # modelpred, a whole timecourse
             return [cls._rounded_value(element) for element in value]
@@ -51,18 +77,22 @@ class ResultFileWriter:
         return value # None, strings, anything added later
 
     @classmethod
-    def write_h5(cls, filepath, data, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec, grid_steps=None, grid_fallback_records=None):
+    def write_h5(cls, filepath, params_xy, r2, cfg, input_filepaths, stimulus_filepath, run_type, duration_sec,
+                 modelpred=None, grid_steps=None, grid_fallback_records=None):
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
-        # unpack list-of-dicts into arrays
-        centerx  = np.array([d['Centerx0']   for d in data], dtype=np.float32)
-        centery  = np.array([d['Centery0']    for d in data], dtype=np.float32)
-        theta    = np.array([d['Theta']       for d in data], dtype=np.float32)
-        sigma_mj = np.array([d['sigmaMajor']  for d in data], dtype=np.float32)
-        sigma_mn = np.array([d['sigmaMinor']  for d in data], dtype=np.float32)
-        r2       = np.array([d['R2']          for d in data], dtype=np.float32)
-        modelpred_list = [d.get('modelpred') for d in data]
-        has_modelpred = modelpred_list[0] is not None
+        # Straight from the fit's arrays. Column 2 is sigma; it is already a magnitude by the time it
+        # gets here (apply_grid_fallback normalises the sign), and abs() keeps that true for any
+        # caller that skips the fallback. Theta and sigmaMinor are placeholders for the isotropic
+        # Gaussian, kept so the two formats describe the same fields.
+        params_xy = np.asarray(params_xy)
+        centerx  = params_xy[:, 0].astype(np.float32)
+        centery  = params_xy[:, 1].astype(np.float32)
+        sigma_mj = np.abs(params_xy[:, 2]).astype(np.float32)
+        theta    = np.zeros(params_xy.shape[0], dtype=np.float32)
+        sigma_mn = np.zeros(params_xy.shape[0], dtype=np.float32)
+        r2       = np.asarray(r2).ravel().astype(np.float32)
+        has_modelpred = modelpred is not None
 
         str_dt = h5py.special_dtype(vlen=str)
 
@@ -77,7 +107,7 @@ class ResultFileWriter:
             pg.create_dataset('sigmaMinor',data=sigma_mn)
             pg.create_dataset('R2',        data=r2)
             if has_modelpred:
-                pg.create_dataset('modelpred', data=np.array(modelpred_list, dtype=np.float32))
+                pg.create_dataset('modelpred', data=np.asarray(modelpred, dtype=np.float32))
 
             # --- metadata/analysis ---
             ag = f.create_group('metadata/analysis')

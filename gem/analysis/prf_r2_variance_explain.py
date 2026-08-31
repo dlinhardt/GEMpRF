@@ -1,6 +1,5 @@
 import numpy as np
 import cupy as cp
-from gem.tools.json_file_operations import JsonMgr
 from gem.utils.hpc_cupy_utils import HpcUtils as Utils
 from gem.model import prf_model
 from gem.signals.signal_synthesizer import SignalSynthesizer
@@ -82,20 +81,3 @@ class R2:
             den = cp.where(nan_mask | zero_mask, 1.0, den)
 
             return num, den
-
-    @classmethod
-    def format_in_json_format(cls, r2_results, refined_matching_results, refined_signal_timecourses, refined_signals_present = True):
-        json_data_results_with_r2 = []
-
-        # default r2 value
-        for i in range((len(refined_matching_results))):
-            r2 = float(r2_results[i])            
-            muX, muY, sigma = refined_matching_results[i]    
-            if refined_signals_present:
-                refined_signal_timecourse = refined_signal_timecourses[i]
-            else:        
-                refined_signal_timecourse = np.array([None])
-            json_entry = JsonMgr.args2estimate_record(muX, muY, sigma, r2, refined_signal_timecourse)    
-            json_data_results_with_r2.append(json_entry)    
-
-        return json_data_results_with_r2   
