@@ -52,7 +52,7 @@ def GEM_Grids2MpInv_numba(neighbours_flat, neighbours_offsets, neighbours_counts
 
     The per-point pseudoinverses are ragged (a point with fewer neighbours yields fewer columns),
     so they are written into a padded (N, 10, max_cols) buffer alongside the true column count.
-    The caller slices them back into the ragged list its consumers expect.
+    The caller keeps that buffer as-is -- it is the layout the refinement's per-batch gather wants.
 
     NOTE: the neighbours are passed flattened (values + per-point offsets/counts) because a
     reflected list of arrays does not type under `parallel=True`.
@@ -68,6 +68,38 @@ def GEM_Grids2MpInv_numba(neighbours_flat, neighbours_offsets, neighbours_counts
         Mp_inv = np.linalg.pinv(M)
         num_cols[multi_dim_point_idx] = Mp_inv.shape[1]
         arr_2d_location_inv_M[multi_dim_point_idx, :, :Mp_inv.shape[1]] = Mp_inv
+
+
+class MpInvTable:
+    """The per-grid-point pseudoinverses, kept in the padded (N, 10, max_cols) layout numba fills.
+
+    The refinement gathers whole rows of this buffer per batch (``padded[best_fit_proj]``), so the
+    padded layout *is* the useful one -- it is what makes the gather a single rectangular fancy-index.
+    This used to be shredded into a list of N trimmed copies right after the kernel wrote it, and then
+    reassembled into the identical padded array on the first refined fit: at N = 942,030 that was
+    ~9.4 million Python-level slices rebuilding 8 GB that had just been thrown away.
+
+    Indexing/iterating this object still yields the trimmed 2-D arrays the old ragged-list contract
+    promised, but as **views** into the padded buffer rather than copies. Views were rejected before
+    because a surviving slice would pin the whole buffer; that inverts once the buffer is the thing
+    being kept.
+
+    NOTE: the padded region is zero, where the old ragged rebuild left NaN. Both are read only through
+    ``_compute_coefficients``, which runs ``nan_to_num(MpInv, nan=0.0)`` first, so the two are exactly
+    equal after masking -- see the padding note in RefineFit._prepare_padded_arrays.
+    """
+
+    __slots__ = ("padded", "num_cols")
+
+    def __init__(self, padded, num_cols):
+        self.padded = padded
+        self.num_cols = num_cols
+
+    def __len__(self):
+        return self.padded.shape[0]
+
+    def __getitem__(self, index):
+        return self.padded[index, :, :self.num_cols[index]]
 
 
 class CoefficientMatix:
@@ -86,10 +118,7 @@ class CoefficientMatix:
 
         GEM_Grids2MpInv_numba(neighbours_flat, neighbours_offsets, neighbours_counts, padded_inv_M, num_cols)
 
-        # Back to the ragged "list of 2-D arrays" contract the consumers rely on. These are copies,
-        # not views: the padded buffer is dense (num_points x 10 x max_cols) and would otherwise be
-        # kept alive in full by any surviving slice, well above what the ragged result needs.
-        arr_2d_location_inv_M = [padded_inv_M[i, :, :num_cols[i]].copy() for i in range(num_points)]
-        del padded_inv_M
-
-        return arr_2d_location_inv_M
+        # Hand back the padded buffer itself. MpInvTable still indexes like the ragged list of 2-D
+        # arrays the consumers were written against, but the refinement reads `.padded` directly
+        # instead of rebuilding it.
+        return MpInvTable(padded_inv_M, num_cols)

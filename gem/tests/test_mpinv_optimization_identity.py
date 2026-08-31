@@ -216,12 +216,43 @@ def test_pinv_bit_exact_against_reference(spaces, case):
 
 
 @pytest.mark.parametrize("case", ["validated", "unvalidated"])
-def test_pinv_results_are_independent_arrays(spaces, case):
-    """Slices must be copies, not views into the dense padded buffer (which would pin ~10 GB)."""
+def test_pinv_results_are_views_into_the_padded_buffer(spaces, case):
+    """Entries must be views, and the padded buffer must be the one the refinement reads.
+
+    This assertion used to be the exact opposite -- entries had to be copies, because a surviving
+    view would pin the dense (N, 10, max_cols) buffer alive. That reasoning inverted when the buffer
+    became the thing we deliberately keep: RefineFit gathers whole rows of it per batch, so shredding
+    it into N copies meant rebuilding the identical array on the first refined fit. Copies are now
+    the waste, not the saving.
+    """
     prf_space = spaces[case]
     result = CoefficientMatix.Wrapper_Grids2MpInv_numba(
         prf_space.multi_dim_points_cpu, prf_space.multi_dim_points_vf_neighbours)
-    assert all(a.base is None for a in result), "results are views into the padded buffer"
+
+    assert result.padded.ndim == 3, "the padded buffer must survive as a dense (N, 10, max_cols) array"
+    assert result.padded.shape[0] == len(result)
+    # no hidden copy: writing through the buffer is visible in the per-point entry
+    assert all(a.base is not None for a in result), "entries are copies, not views"
+    result.padded[0, 0, 0] = 1234.5
+    assert result[0][0, 0] == 1234.5
+
+
+@pytest.mark.parametrize("case", ["validated", "unvalidated"])
+def test_pinv_padding_region_is_zero(spaces, case):
+    """The pad columns must be 0.0.
+
+    RefineFit._compute_coefficients runs nan_to_num(MpInv, nan=0.0) before the einsum, so the kernel's
+    zero padding and the NaN padding the old ragged rebuild produced are equal after masking. That
+    equivalence is what makes keeping the buffer bit-identical, so pin the padding value down.
+    """
+    prf_space = spaces[case]
+    result = CoefficientMatix.Wrapper_Grids2MpInv_numba(
+        prf_space.multi_dim_points_cpu, prf_space.multi_dim_points_vf_neighbours)
+
+    for i in range(len(result)):
+        pad = result.padded[i, :, result.num_cols[i]:]
+        if pad.size:
+            assert np.array_equal(pad, np.zeros_like(pad)), f"point {i}: padding is not zero"
 
 
 @pytest.mark.parametrize("case", ["validated", "unvalidated"])

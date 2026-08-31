@@ -19,58 +19,66 @@ class RefineFit:
     padded_multi_dim_points_neighbours_flat_indices = None
 
     @classmethod
-    def _prepare_padded_arrays(cls, arr_2d_location_inv_M_cpu, prf_space, on_gpu):
+    def _prepare_padded_arrays(cls, arr_2d_location_inv_M_cpu, prf_space):
         """Prepare padded arrays for arr_2d_location_inv_M and multi_dim_points_neighbours.
 
-        NOTE: both stay in host memory regardless of ``on_gpu``. The padded M-inverse is
+        NOTE: both stay in host memory. The padded M-inverse is
         (num_model_signals, 10, max_neighbours * 4) float64 -- several GB for a dense grid -- but only
         the ``num_y_signals`` rows of the current batch are ever read, so keeping it on the device
         wasted most of a card for a few MB of gathers per batch.
         """
-        # --- 1a) Prepare arr_2d_location_inv_M ---
-        arr_2d_location_inv_M_cpu_list = arr_2d_location_inv_M_cpu
-        N = len(arr_2d_location_inv_M_cpu_list)
-        R = arr_2d_location_inv_M_cpu_list[0].shape[0]
-        cols = np.array([a.shape[1] for a in arr_2d_location_inv_M_cpu_list], dtype=int)
-        max_cols = int(cols.max())
-
-        if (cols == max_cols).all():
-            padded_arr_cpu = np.stack(arr_2d_location_inv_M_cpu_list, axis=0)
+        # --- 1a) arr_2d_location_inv_M: already padded by the numba kernel, so take it as it is ---
+        # Wrapper_Grids2MpInv_numba fills a dense (N, 10, max_cols) buffer and hands it over in an
+        # MpInvTable. Rebuilding that array here -- which is what this used to do, at ~9.4M Python
+        # slices and 8 GB of fresh pages for a 942k-point grid -- was the whole of the "first file is
+        # 5x slower than every later file" effect, because this runs lazily inside the first batch.
+        #
+        # PADDING: the kernel leaves the pad region 0.0 where this used to leave np.nan. Both are only
+        # ever read through _compute_coefficients, which does nan_to_num(MpInv, nan=0.0) before the
+        # einsum, so the two are equal element for element after masking.
+        if hasattr(arr_2d_location_inv_M_cpu, "padded"):
+            padded_arr_cpu = arr_2d_location_inv_M_cpu.padded
         else:
-            # vectorized padding using insert
-            cumsum_cols = np.cumsum(cols)
-            pad_lens = max_cols - cols
-            where_to_pad = np.repeat(cumsum_cols, pad_lens) if pad_lens.sum() > 0 else np.array([], dtype=int)
-
-            padded_rows = []
-            for r in range(R):
-                row_concat = np.concatenate([a[r] for a in arr_2d_location_inv_M_cpu_list])
-                if where_to_pad.size:
-                    row_padded = np.insert(row_concat, where_to_pad, np.nan)
-                else:
-                    row_padded = row_concat
-                padded_rows.append(row_padded.reshape(N, max_cols))
-            padded_arr_cpu = np.stack(padded_rows, axis=1)
+            # Fallback for callers that still hand over a plain ragged list (tests, and the leftover
+            # reference implementations below).
+            arr_2d_location_inv_M_cpu_list = list(arr_2d_location_inv_M_cpu)
+            N = len(arr_2d_location_inv_M_cpu_list)
+            R = arr_2d_location_inv_M_cpu_list[0].shape[0]
+            cols = np.array([a.shape[1] for a in arr_2d_location_inv_M_cpu_list], dtype=int)
+            max_cols = int(cols.max())
+            padded_arr_cpu = np.zeros((N, R, max_cols), dtype=np.float64)
+            for i, a in enumerate(arr_2d_location_inv_M_cpu_list):
+                padded_arr_cpu[i, :, :a.shape[1]] = a
 
         # --- 1b) Prepare multi_dim_points_neighbours_flat_indices ---
-        neigh_list = [np.asarray(a).ravel() for a in prf_space.multi_dim_points_neighbours_flat_indices]
-        lens = np.array([a.size for a in neigh_list], dtype=int)
+        # The neighbour indices are a flat buffer plus per-point counts, so np.array_split is the
+        # exact inverse of how they were concatenated and costs no copying.
+        neigh_flat, lens = prf_space.get_neighbour_flat_indices_and_counts()
         max_len = int(lens.max())
 
-        if (lens == max_len).all():
-            padded_neigh_cpu = np.stack(neigh_list, axis=0)
-        else:
-            cumsum_lens = np.cumsum(lens)
-            pad_lens2 = max_len - lens
-            where_to_pad2 = np.repeat(cumsum_lens, pad_lens2) if pad_lens2.sum() > 0 else np.array([], dtype=int)
-            all_concat = np.concatenate(neigh_list)
-            padded_all = np.insert(all_concat, where_to_pad2, -1) if where_to_pad2.size else all_concat
-            padded_neigh_cpu = padded_all.reshape(N, max_len)
+        # Scatter straight into the padded result: row i gets its lens[i] values, the rest stays -1.
+        padded_neigh_cpu = np.full((lens.shape[0], max_len), -1, dtype=np.int64)
+        fill_mask = np.arange(max_len)[None, :] < lens[:, None]
+        padded_neigh_cpu[fill_mask] = neigh_flat
 
         # --- Both stay on the host; only the per-batch slice is moved to the device ---
         cls.padded_arr_2d_location_inv_M = padded_arr_cpu
-        cls.padded_multi_dim_points_neighbours_flat_indices = padded_neigh_cpu.astype(np.int64)[:, :, None]
+        cls.padded_multi_dim_points_neighbours_flat_indices = padded_neigh_cpu[:, :, None]
 
+
+    @classmethod
+    def prepare(cls, arr_2d_location_inv_M_cpu, prf_space):
+        """Build the padded lookup tables up front, during setup.
+
+        The lazy guards below would do this on the first refined fit, which puts a one-time cost
+        inside the region the per-file timer wraps -- the first file of a run then looks dramatically
+        slower than every file after it. Calling this once after the M-inverse thread joins keeps the
+        guards as a fallback for callers that skip setup (the tests, mainly) without ever letting them
+        fire in a real run.
+        """
+        if arr_2d_location_inv_M_cpu is None:
+            return
+        cls._prepare_padded_arrays(arr_2d_location_inv_M_cpu, prf_space)
 
     @classmethod
     def get_neighbour_columns(cls, prf_space: PRFSpace, best_fit_proj, arr_2d_location_inv_M_cpu):
@@ -82,7 +90,7 @@ class RefineFit:
         ``get_refined_fit_results``.
         """
         if cls.padded_arr_2d_location_inv_M is None or cls.padded_multi_dim_points_neighbours_flat_indices is None:
-            cls._prepare_padded_arrays(arr_2d_location_inv_M_cpu, prf_space, on_gpu=False)
+            cls._prepare_padded_arrays(arr_2d_location_inv_M_cpu, prf_space)
 
         best_fit_proj_cpu = cls._as_host_indices(best_fit_proj)
         all_block_flat_indices_cpu = cls.padded_multi_dim_points_neighbours_flat_indices[best_fit_proj_cpu].squeeze()
@@ -93,7 +101,7 @@ class RefineFit:
         return cp.asnumpy(best_fit_proj) if isinstance(best_fit_proj, cp.ndarray) else np.asarray(best_fit_proj)
 
     @classmethod
-    def get_refined_fit_results(cls, prf_space: PRFSpace, num_Y_signals, best_fit_proj,
+    def get_refined_fit_results(cls, prf_space: PRFSpace, best_fit_proj,
                                 arr_2d_location_inv_M_cpu, refine_input_vecs, neighbour_columns):
         """Solve the local quadratic for every y-signal.
 
@@ -105,7 +113,7 @@ class RefineFit:
         pkg = (np, cp)[on_gpu]
 
         if cls.padded_arr_2d_location_inv_M is None or cls.padded_multi_dim_points_neighbours_flat_indices is None:
-            cls._prepare_padded_arrays(arr_2d_location_inv_M_cpu, prf_space, on_gpu=False)
+            cls._prepare_padded_arrays(arr_2d_location_inv_M_cpu, prf_space)
 
         # ---------- Gather MpInv for this batch (host-side fancy index, then one small upload) ----------
         best_fit_proj_cpu = cls._as_host_indices(best_fit_proj)
@@ -122,9 +130,8 @@ class RefineFit:
         A, B, C = CoefficientMatrix.create_cofficients_matrices_A_B_and_C_vectorized(coefficients)
 
         # ---------- Solve system ----------
-        refined_params_vecs_gpu = pkg.einsum('fij,fj->fi', pkg.linalg.pinv(2*A), -B) # as some of the A matrices might be singular so using pinv instead of inv
-
-        return refined_params_vecs_gpu, None
+        # pinv rather than inv: some of the A matrices are singular
+        return pkg.einsum('fij,fj->fi', pkg.linalg.pinv(2*A), -B)
 
 
     # ----------------- Helper functions -----------------

@@ -20,6 +20,8 @@ from numba_kdtree import KDTree
 from numba import njit
 from typing import Callable
 from joblib import Parallel, delayed, parallel_backend, effective_n_jobs
+
+from gem.utils.cpu_budget import thread_budget
 from gem.utils.gem_gpu_manager import GemGpuManager as ggm
 from gem.utils.logger import Logger
 
@@ -108,7 +110,7 @@ def multidim2flatIdx(point : list, shape : list)->int:
 
 def compute_multidim_points_neighbours_multithreaded(all_multi_dim_points_arr_cpu: np.ndarray, num_spatial_dimensions: int, all_neighbours_indices_xy: np.ndarray, points_xy: np.ndarray,
                                              num_total_dimensions: int, num_extra_dimensions: int, extra_dimensions: list, num_neighbors: int = 9,
-                                             validated_multidim_indices: np.ndarray = None, validated_mask: np.ndarray = None, n_jobs: int = -1):
+                                             validated_multidim_indices: np.ndarray = None, validated_mask: np.ndarray = None, n_jobs: int = None):
     """
     Computes the multidimensional points neighbours (in terms of indices and Visual Field values) using multiprocessing.
 
@@ -134,6 +136,9 @@ def compute_multidim_points_neighbours_multithreaded(all_multi_dim_points_arr_cp
         product_shape_extra_dimensions *= len(dim)
     xy_row_ids = np.asarray(validated_multidim_indices, dtype=np.int64) // product_shape_extra_dimensions
 
+    # None -> half the available cores (cpu_budget); -1 would take every one of them, which makes
+    # concurrent analyses fight over the machine instead of sharing it
+    n_jobs = thread_budget() if n_jobs is None else n_jobs
     num_workers = effective_n_jobs(n_jobs)
     num_chunks = max(1, min(len(validated_points), num_workers * 4))
     chunk_slices = np.array_split(np.arange(len(validated_points)), num_chunks)
@@ -298,6 +303,10 @@ class PRFSpace:
         self.__multi_dim_points_arr_gpu = None
         self.__multi_dim_points_neighbours_vf_values_list = []
         self.__multi_dim_points_neighbours_flat_indices_list = []
+        # Flat form of the neighbour indices (one buffer + per-point counts). Built on first use and
+        # kept instead of the per-point list -- see get_neighbour_flat_indices_and_counts.
+        self.__neighbour_flat_indices = None
+        self.__neighbour_counts = None
 
         #NOTE: Validation of multi-dimensional points
         # NOTE: !!!!! if the validated pRF points are not computed until the function "compute_multidim_points_neighbours()" is called, ....
@@ -359,13 +368,41 @@ class PRFSpace:
     @property
     def multi_dim_points_neighbours_flat_indices(self):
         """
-        Returns the multi-dimensional points neighbours indices. 
+        Returns the multi-dimensional points neighbours indices.
         NOTE: The first value in each row is the flat index of the XY point, and rest are the coordinates of extra dimensions.
-        
+
         Returns:
             list: A list of multi-dimensional points neighbours indices.
         """
+        if self.__multi_dim_points_neighbours_flat_indices_list is None:
+            # Served as views out of the flat buffer. np.array_split at the cumulative counts is the
+            # exact inverse of the concatenation that built it, and copies nothing.
+            offsets = np.cumsum(self.__neighbour_counts)[:-1]
+            return np.array_split(self.__neighbour_flat_indices, offsets)
         return self.__multi_dim_points_neighbours_flat_indices_list
+
+    def get_neighbour_flat_indices_and_counts(self):
+        """Neighbour indices as one flat buffer plus per-point counts.
+
+        The neighbour search hands back a Python list with one small array per grid point -- 942,030
+        of them on a dense grid -- and every consumer's first move is to concatenate it. So do that
+        once, keep the flat form, and drop the list: ``multi_dim_points_neighbours_flat_indices``
+        rebuilds the per-point arrays as views with ``np.array_split`` when something still wants
+        them.
+
+        Returns:
+            tuple: (flat int64 indices, int64 count per point)
+        """
+        if self.__neighbour_flat_indices is None:
+            neigh_list = self.__multi_dim_points_neighbours_flat_indices_list
+            counts = np.fromiter((np.asarray(a).size for a in neigh_list),
+                                 dtype=np.int64, count=len(neigh_list))
+            flat = np.concatenate([np.asarray(a).ravel() for a in neigh_list])
+            self.__neighbour_flat_indices = flat.astype(np.int64, copy=False)
+            self.__neighbour_counts = counts
+            self.__multi_dim_points_neighbours_flat_indices_list = None
+
+        return self.__neighbour_flat_indices, self.__neighbour_counts
 
     def get_grid_steps(self)->np.ndarray:
         """
@@ -454,7 +491,8 @@ class PRFSpace:
             list: A list of multidimensional points neighbours.            
         """
         if self.__multi_dim_points_neighbours_vf_values_list:
-            return self.__multi_dim_points_neighbours_flat_indices_list, self.__multi_dim_points_neighbours_vf_values_list
+            # via the property: the per-point list is dropped once the flat form has been built
+            return self.multi_dim_points_neighbours_flat_indices, self.__multi_dim_points_neighbours_vf_values_list
         
         # NOTE: !!!!! if the validated pRF points are not computed yet, it means the user does not want to validate the points. In this case, we consider all multi-dimensional points are validated !!!!!
         if self.__validated_multidim_indices is None:
@@ -490,7 +528,7 @@ class PRFSpace:
             validated_mask = validated_mask)
         Logger.print_timing_message(f"neighbour search total ({_num_validated} validated points, k={num_neighbors}): {time.time() - _t_neighbours_start:.2f}s")
 
-        return self.__multi_dim_points_neighbours_flat_indices_list, self.__multi_dim_points_neighbours_vf_values_list
+        return self.multi_dim_points_neighbours_flat_indices, self.__multi_dim_points_neighbours_vf_values_list
 
     # validate the multi-dimensional points (e.g. in case of DoG model, sigma2 should be greater than sigma1)
     def keep_validated_sampling_points(self, validation_function: Callable)->None:
