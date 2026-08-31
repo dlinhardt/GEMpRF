@@ -119,6 +119,30 @@ class HpcUtils:
             cls.gpu_memory_pool = cp.get_default_memory_pool()
 
         cls.gpu_memory_pool.free_all_blocks()
+
+    @classmethod
+    def release_pool_on_all_devices(cls):
+        """Hand every free pool block back to the driver, on each visible device.
+
+        The pool never shrinks on its own, and model-signal synthesis reserves far more than the fit
+        goes on to hold: a 15,000-signal model-curve chunk is 10.1 GiB at a 301x301 stimulus. Those
+        blocks stay reserved and fragmented, so the card ends up ~98% claimed by the pool with
+        nothing contiguous left -- and the fit then fails to allocate its (batch, num_model_signals)
+        error matrix while `device_available_mem_bytes` still reports many GB free, because that
+        figure counts pool-free blocks as available. Freeing here makes the two agree.
+
+        Frees per device explicitly rather than relying on the pool to walk them, and never raises:
+        this is an optimisation, and a run that cannot free is still a run that can proceed.
+        """
+        if cls.gpu_memory_pool is None:
+            cls.gpu_memory_pool = cp.get_default_memory_pool()
+
+        try:
+            for device_id in range(cls.get_number_of_gpus()):
+                with cp.cuda.Device(device_id):
+                    cls.gpu_memory_pool.free_all_blocks()
+        except Exception:
+            pass
     
     @classmethod
     def delete_gpu_variables(cls, variable : List[cp.ndarray]):

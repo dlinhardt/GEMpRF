@@ -20,9 +20,16 @@ class GridFit:
         return e_gpu
 
     @classmethod
-    def _compute_best_projection_fit(cls, e_gpu):
-        best_fit_proj_gpu = cp.nanargmax(e_gpu, axis=1)     #<<<<----find the max. element's index for the rows along their columns (that's why axis=1)
-        return best_fit_proj_gpu
+    def _fold_positive_infinity(cls, e_gpu):
+        """Rewrite +inf error terms to -inf, in place.
+
+        orthonormalize_modelled_signals() flags a degenerate model signal -- a pRF that drifted out
+        of the aperture, leaving a zero column -- by setting its whole column to +inf. Error terms
+        are maximised, so leaving +inf would make exactly those signals win every argmax and never
+        revert to their grid point. Folding to -inf makes them lose instead.
+        """
+        e_gpu[cp.isinf(e_gpu) & (e_gpu > 0)] = -cp.inf
+        return e_gpu
 
     @classmethod
     def _y_signals_on_device(cls, Y_signals_gpu, device_id, default_gpu_id):
@@ -46,10 +53,8 @@ class GridFit:
         default_gpu_id = ggm.get_instance().default_gpu_id
         num_batches = len(S_prime_cm_gpu_batches)
 
-        # compute total signals present across all the batches
-        total_model_signals = 0
-        for i in range(num_batches):
-            total_model_signals = total_model_signals + S_prime_cm_gpu_batches[i].shape[1] # i.e.  number of columns: bacuse each signal is present across a single column
+        # each model signal occupies one column, so the grid width is the sum of the chunk widths
+        total_model_signals = sum(batch.shape[1] for batch in S_prime_cm_gpu_batches)
 
         # NOTE: with a single model-signal chunk that already lives on the default device there is
         # nothing to assemble -- the product IS the error matrix. Allocating `out` and copying the
@@ -57,9 +62,8 @@ class GridFit:
         # GPU, where that one chunk spans the whole grid and the copy is gigabytes.
         if out is None and num_batches == 1 and S_prime_cm_gpu_batches[0].device.id == default_gpu_id:
             with cp.cuda.Device(default_gpu_id):
-                e_gpu = cls.compute_error_term(Y_signals_gpu, S_prime_cm_gpu_batches[0])
-                e_gpu[cp.isinf(e_gpu) & (e_gpu > 0)] = -cp.inf # as in the per-chunk path below
-                return e_gpu
+                return cls._fold_positive_infinity(
+                    cls.compute_error_term(Y_signals_gpu, S_prime_cm_gpu_batches[0]))
 
         with cp.cuda.Device(default_gpu_id):
             total_y_signals = Y_signals_gpu.shape[1]
@@ -75,8 +79,8 @@ class GridFit:
 
             with cp.cuda.Device(device_id):
                 current_device_Y_signals = cls._y_signals_on_device(Y_signals_gpu, device_id, default_gpu_id)
-                chunk_e_result_gpu = cls.compute_error_term(current_device_Y_signals, S_prime_cm_gpu_batches[batch_idx])
-                chunk_e_result_gpu[cp.isinf(chunk_e_result_gpu) & (chunk_e_result_gpu > 0)] = -cp.inf # replace +inf with -inf so that indices with "inf" are not seleted as best fit at the argmax() step
+                chunk_e_result_gpu = cls._fold_positive_infinity(
+                    cls.compute_error_term(current_device_Y_signals, S_prime_cm_gpu_batches[batch_idx]))
 
             # finally, get the "error" result back to the default device
             with cp.cuda.Device(default_gpu_id):
@@ -154,14 +158,9 @@ class GridFit:
             column_idx = column_idx + num_signals_current_batch
 
         with cp.cuda.Device(default_gpu_id):
-            matched = cp.concatenate(parts)
-            # Same sanitisation the full-matrix path applied: orthonormalize_modelled_signals() marks
-            # a degenerate model signal (pRF drifted out of the aperture) by setting its whole column
-            # to +inf, and the caller treats a *smaller* error as "refinement made it worse". Leaving
-            # +inf here would score those as the best possible fit instead of the worst, so they would
-            # never revert to their grid point.
-            matched[cp.isinf(matched) & (matched > 0)] = -cp.inf
-            return matched
+            # Same fold the full-matrix path applies; here it matters because the caller reads a
+            # smaller error as "refinement made it worse".
+            return cls._fold_positive_infinity(cp.concatenate(parts))
 
     @classmethod
     def gather_neighbour_terms(cls, error_matrix, neighbour_columns):
@@ -176,15 +175,49 @@ class GridFit:
             return error_matrix[rows, cp.clip(columns_gpu, 0, error_matrix.shape[1] - 1)]
 
     @classmethod
+    def _chunk_column_map(cls, neighbour_columns_cpu, column_offset, chunk_width):
+        """Which of this chunk's columns are wanted, and where each request lands in the narrow product.
+
+        Returns ``(needed_columns, narrow_columns, in_chunk)`` or ``None`` when no y-signal asks for
+        anything in this chunk. ``needed_columns`` is the ascending, de-duplicated list of chunk-local
+        columns to actually multiply; ``narrow_columns`` maps every entry of ``neighbour_columns`` to
+        its position within that narrow result (arbitrary where ``in_chunk`` is False, and masked off
+        by the caller).
+
+        Built with a boolean mark + flatnonzero rather than np.unique: same ascending-unique result,
+        O(chunk_width) instead of a sort, and ~3x cheaper measured. It runs once per chunk and is
+        shared by every theta.
+        """
+        local_columns = neighbour_columns_cpu - column_offset
+        in_chunk = (local_columns >= 0) & (local_columns < chunk_width)
+        if not in_chunk.any():
+            return None
+
+        wanted = np.zeros(chunk_width, dtype=bool)
+        wanted[local_columns[in_chunk]] = True
+        needed_columns = np.flatnonzero(wanted)
+
+        position_of_column = np.zeros(chunk_width, dtype=np.int32)
+        position_of_column[needed_columns] = np.arange(needed_columns.size, dtype=np.int32)
+        # out-of-chunk requests are clipped to a valid index and then masked away, exactly as before
+        narrow_columns = position_of_column[np.clip(local_columns, 0, chunk_width - 1)]
+
+        return needed_columns, narrow_columns, in_chunk
+
+    @classmethod
     def accumulate_derivative_neighbour_terms(cls, Y_signals_gpu, dS_prime_dtheta_cm_gpu_batches_list,
                                               neighbour_columns, out=None):
         """Derivative error terms, evaluated only at the neighbour columns of the winning grid point.
 
-        For every model-signal chunk this runs the very same ``Y.T @ dS'_chunk`` product the old dense
-        path ran, but keeps only the columns that some y-signal actually asks for and then drops the
-        chunk. One theta is processed at a time, so at most one (num_y_signals, chunk_width) temporary
-        is alive. ``out`` is (num_params, num_y_signals, num_neighbours) on the default device and is
-        added to, which is how the concatenated runs are summed.
+        Only the <=27 neighbours of each y-signal's winner are ever read, so only those columns of
+        each model-signal chunk are multiplied: the chunk is sliced down to the columns some y-signal
+        actually asks for and ``Y.T @ dS'_narrow`` is run on that. The full-width product this used to
+        form was 75% of the fit's arithmetic and ~2-8% of it was read, and the (num_y_signals,
+        chunk_width) temporary it needed was 5.96 GB on a single-GPU 942k-point grid -- the same size
+        as the error matrix it had to sit alongside.
+
+        ``out`` is (num_params, num_y_signals, num_neighbours) on the default device and is added to,
+        which is how the concatenated runs are summed.
         """
         default_gpu_id = ggm.get_instance().default_gpu_id
         num_theta_params = len(dS_prime_dtheta_cm_gpu_batches_list)
@@ -205,20 +238,26 @@ class GridFit:
             chunk_width = reference_chunk.shape[1]
             device_id = reference_chunk.device.id
 
+            column_map = cls._chunk_column_map(neighbour_columns_cpu, column_idx, chunk_width)
+            if column_map is None:  # no winner's neighbourhood reaches into this chunk
+                column_idx = column_idx + chunk_width
+                continue
+            needed_columns_cpu, narrow_columns_cpu, in_chunk_cpu = column_map
+
             with cp.cuda.Device(device_id):
-                # columns of this chunk, in chunk-local coordinates; everything else is masked off
-                local_columns = cp.asarray(neighbour_columns_cpu) - column_idx
-                in_chunk = (local_columns >= 0) & (local_columns < chunk_width)
-                local_columns = cp.clip(local_columns, 0, chunk_width - 1)
+                needed_columns = cp.asarray(needed_columns_cpu)
+                narrow_columns = cp.asarray(narrow_columns_cpu)
+                in_chunk = cp.asarray(in_chunk_cpu)
                 rows = cp.arange(num_y_signals)[:, None]
                 current_device_Y_signals = cls._y_signals_on_device(Y_signals_gpu, device_id, default_gpu_id)
 
                 for theta in range(num_theta_params):
-                    # identical product to the old dense path -- same shapes, so same result
-                    chunk_de_dtheta_gpu = cls.compute_error_term(current_device_Y_signals,
-                                                                 dS_prime_dtheta_cm_gpu_batches_list[theta][chunk_idx])
-                    gathered = cp.where(in_chunk, chunk_de_dtheta_gpu[rows, local_columns], 0.0)
-                    del chunk_de_dtheta_gpu
+                    narrow_dS_prime = dS_prime_dtheta_cm_gpu_batches_list[theta][chunk_idx][:, needed_columns]
+                    narrow_de_dtheta_gpu = cls.compute_error_term(current_device_Y_signals, narrow_dS_prime)
+                    del narrow_dS_prime
+
+                    gathered = cp.where(in_chunk, narrow_de_dtheta_gpu[rows, narrow_columns], 0.0)
+                    del narrow_de_dtheta_gpu
 
                     with cp.cuda.Device(default_gpu_id):
                         out[theta] += gathered if device_id == default_gpu_id else cp.asarray(gathered)

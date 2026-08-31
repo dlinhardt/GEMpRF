@@ -391,3 +391,77 @@ def test_matched_error_terms_map_positive_infinity_to_negative():
     assert not np.isposinf(matched).any(), "no +inf may survive"
     finite = [i for i in range(num_signals) if i != 3]
     np.testing.assert_allclose(matched[finite], np.diagonal(Y.T @ S_prime)[finite], rtol=0, atol=1e-12)
+
+
+def test_narrow_derivative_gemm_matches_the_full_width_product():
+    """Slicing dS' down to the requested columns must reproduce the full-width product.
+
+    accumulate_derivative_neighbour_terms used to compute Y.T @ dS'_chunk over the whole chunk and
+    keep the <=27 columns per row that the refinement reads -- 75% of the fit's arithmetic, ~2-8% of
+    it used, and a (num_y_signals, chunk_width) temporary that was 5.96 GB on a single-GPU 942k-point
+    grid. It now multiplies only the columns some y-signal asks for.
+
+    Y is deliberately NOT the identity here: the other tests in this file use Y = I, which makes the
+    product exact and so cannot detect a reassociation. With a real Y, cuBLAS may pick a different
+    kernel for the narrower N, so this asserts allclose rather than equality -- the tolerance is
+    float64 noise, far below anything the fit can mean.
+    """
+    cp = pytest.importorskip("cupy", reason="needs a CUDA GPU")
+    from gem.fitting.hpc_grid_fit import GridFit
+    from gem.utils.gem_gpu_manager import GemGpuManager
+
+    if GemGpuManager.get_instance() is None:
+        GemGpuManager(default_gpu_id=0)
+
+    rng = np.random.default_rng(11)
+    num_timepoints = 23
+    Y = rng.normal(size=(num_timepoints, NUM_Y_SIGNALS))
+    dS_prime = rng.normal(size=(NUM_PARAMS, num_timepoints, NUM_MODEL_SIGNALS))
+    neighbour_columns = rng.integers(-1, NUM_MODEL_SIGNALS, size=(NUM_Y_SIGNALS, NUM_NEIGHBOURS))
+
+    Y_signals_gpu = cp.asarray(Y)
+    dS_prime_batches = [[] for _ in range(NUM_PARAMS)]
+    column_idx = 0
+    for chunk_width in CHUNK_WIDTHS:
+        for theta in range(NUM_PARAMS):
+            dS_prime_batches[theta].append(cp.asarray(dS_prime[theta][:, column_idx:column_idx + chunk_width]))
+        column_idx += chunk_width
+
+    gathered = cp.asnumpy(GridFit.accumulate_derivative_neighbour_terms(
+        Y_signals_gpu, dS_prime_batches, neighbour_columns))
+
+    # reference: the full-width product, gathered afterwards -- what this used to do
+    rows = np.arange(NUM_Y_SIGNALS)[:, None]
+    for theta in range(NUM_PARAMS):
+        full = Y.T @ dS_prime[theta]
+        expected = np.where(neighbour_columns >= 0,
+                            full[rows, np.clip(neighbour_columns, 0, NUM_MODEL_SIGNALS - 1)], 0.0)
+        np.testing.assert_allclose(gathered[theta], expected, rtol=1e-12, atol=1e-12)
+
+
+def test_narrow_derivative_gemm_handles_a_chunk_nobody_asks_for():
+    """A chunk no winner's neighbourhood reaches into is skipped entirely and contributes zero."""
+    cp = pytest.importorskip("cupy", reason="needs a CUDA GPU")
+    from gem.fitting.hpc_grid_fit import GridFit
+    from gem.utils.gem_gpu_manager import GemGpuManager
+
+    if GemGpuManager.get_instance() is None:
+        GemGpuManager(default_gpu_id=0)
+
+    rng = np.random.default_rng(12)
+    num_timepoints, chunk_width, num_chunks = 9, 10, 3
+    total = chunk_width * num_chunks
+    Y = rng.normal(size=(num_timepoints, NUM_Y_SIGNALS))
+    dS_prime = rng.normal(size=(1, num_timepoints, total))
+
+    # every request lands in the first chunk, so chunks 1 and 2 must be skipped
+    neighbour_columns = rng.integers(0, chunk_width, size=(NUM_Y_SIGNALS, NUM_NEIGHBOURS))
+
+    batches = [[cp.asarray(dS_prime[0][:, i * chunk_width:(i + 1) * chunk_width])
+                for i in range(num_chunks)]]
+    gathered = cp.asnumpy(GridFit.accumulate_derivative_neighbour_terms(
+        cp.asarray(Y), batches, neighbour_columns))
+
+    rows = np.arange(NUM_Y_SIGNALS)[:, None]
+    expected = (Y.T @ dS_prime[0])[rows, neighbour_columns]
+    np.testing.assert_allclose(gathered[0], expected, rtol=1e-12, atol=1e-12)
