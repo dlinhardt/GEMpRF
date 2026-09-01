@@ -22,6 +22,10 @@ class DataSource(Enum):
 class ObservedData:
     def __init__(self, data_source : DataSource):
         self.data_source = data_source
+        # TR of the last file loaded, in seconds, or None when the file cannot state one (GIFTI) or
+        # states an unusable one. Read by validate_stimulus_timing() to turn the timepoint count into
+        # a duration it can compare against the stimulus.
+        self.repetition_time = None
 
     def get_y_signals(self, filepath):
         if self.data_source is DataSource.measured_data:
@@ -37,8 +41,11 @@ class ObservedData:
         if isinstance(bold_response_img, nib.gifti.GiftiImage):
             # Stack all data arrays (each one corresponds to a surface vertex timeseries)
             Y_signals_cpu = np.column_stack([darray.data for darray in bold_response_img.darrays])
+            # a GIFTI carries no dependable TR, so callers fall back to a header-free check
+            self.repetition_time = None
         else:
             Y_signals_cpu = bold_response_img.get_fdata()
+            self.repetition_time = self._repetition_time_from_header(bold_response_img.header)
 
         # Shape example: (x, y, z, t) or (n_vertices, t)
         shape = Y_signals_cpu.shape
@@ -57,4 +64,18 @@ class ObservedData:
         Y_signals_cpu = Y_signals_cpu.T
 
         return Y_signals_cpu
+
+    @staticmethod
+    def _repetition_time_from_header(header):
+        """TR in seconds from a NIfTI header's pixdim[4], or None when it does not carry one.
+
+        A zero or non-finite pixdim[4] is what an image that never had its temporal spacing written
+        looks like; reporting None for those keeps a caller from computing a scan duration of 0 and
+        drawing a conclusion from it.
+        """
+        try:
+            tr = float(header['pixdim'][4])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
+        return tr if np.isfinite(tr) and tr > 0 else None
 

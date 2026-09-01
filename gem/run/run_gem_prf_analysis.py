@@ -53,7 +53,8 @@ from gem.tools.json_file_operations import JsonMgr
 from gem.tools.result_file_writer import ResultFileWriter
 from gem.utils.gem_gpu_manager import GemGpuManager as ggm
 from gem.utils.logger import Logger
-from gem.utils.gem_errors import TimepointMismatchError, InputFileMissingError
+from gem.utils.gem_errors import InputFileMissingError
+from gem.utils.stimulus_timing import validate_stimulus_timing
 from gem.utils.phase_timer import PhaseTimer
 from gem.utils.gem_h5_file_handler import H5FileManager
 from gem.signals.hrf_generator import spm_hrf_compat
@@ -582,10 +583,9 @@ class GEMpRFAnalysis:
         # process bathches
         Y_signals_cpu = Y_signals_cpu[:, None] if Y_signals_cpu.ndim == 1 else Y_signals_cpu # in case only one signal is present
 
-        # fail this analysis if number of timepoints in y-signals and stimulus do not match
-        stimulus_num_frames = (stimulus.NumFrames, stimulus.NumFramesDownsampled)[stimulus.HighTemporalResolutionEnabled]
-        if Y_signals_cpu.shape[0] != stimulus_num_frames:
-            raise TimepointMismatchError(f"Number of timepoints in measured fMRI data ({Y_signals_cpu.shape[0]}) and stimulus ({stimulus_num_frames}) do not match for file: {measured_data_filepath}")
+        # fail this analysis unless the stimulus matches the data in both timepoint count and the
+        # stretch of time it covers
+        validate_stimulus_timing(stimulus, Y_signals_cpu.shape[0], y_data.repetition_time, measured_data_filepath)
 
         total_y_signals = Y_signals_cpu.shape[1]
         batch_size = cls.get_y_batch_size(cfg, total_y_signals, len(prf_space.multi_dim_points_cpu),
@@ -882,6 +882,10 @@ class GEMpRFAnalysis:
             # y-signals
             y_data = ObservedData(data_source=DataSource.measured_data)
             Y_signals_cpu = y_data.get_y_signals(measured_data_filepath)
+            # every concatenated item is fitted against its own task's stimulus, so each one has to
+            # be checked against that stimulus and its own input file
+            validate_stimulus_timing(task_specific_data_dict[task_name].stimulus, Y_signals_cpu.shape[0],
+                                     y_data.repetition_time, measured_data_filepath)
             y_signals_info = YSignalsInfo(Y_signals_cpu, task_name)
             arr_Y_signals_cpu.append(y_signals_info)
             # arr_Y_signals_cpu.append((Y_signals_cpu, task_name))
