@@ -37,6 +37,7 @@ from gem.fitting.hpc_refine_fit import RefineFit
 from gem.analysis.prf_analysis import PRFAnalysis
 from gem.space.coefficient_matrix import CoefficientMatix
 from gem.utils.hpc_cupy_utils import HpcUtils as gpu_utils
+from gem.utils import oom_retry
 from gem.model.selected_prf_model import SelectedPRFModel
 from gem.signals.signal_synthesizer import SignalSynthesizer
 from gem.model.prf_stimulus import Stimulus
@@ -473,8 +474,12 @@ class GEMpRFAnalysis:
         return int(raw), False
 
     @classmethod
-    def get_y_batch_size(cls, cfg, total_y_signals, num_model_signals):
+    def get_y_batch_size(cls, cfg, total_y_signals, num_model_signals, override=None):
         """Vertices per Y-batch, sized against the free VRAM actually available.
+
+        ``override`` short-circuits everything below: it is the size an out-of-memory retry worked
+        out from the failed allocation itself (see gem/utils/oom_retry.py), which beats any estimate
+        made here because it knows which array actually ran out.
 
         ``<batches>`` stays the upper bound by default, so a config that already fits keeps exactly the
         batch size -- and therefore exactly the results -- it has today; the measurement can only make
@@ -482,6 +487,9 @@ class GEMpRFAnalysis:
         ``auto="true"`` the batch size follows the measurement in both directions, which is worth it
         when the configured value is far more conservative than the hardware needs.
         """
+        if override is not None:
+            return cls._record_batch_size(max(1, min(int(override), total_y_signals)))
+
         num_batches, auto = cls._resolve_batches_setting(cfg)
         configured_batch_size = max(1, int(total_y_signals / max(1, num_batches)))
 
@@ -491,7 +499,7 @@ class GEMpRFAnalysis:
         except Exception as exc:
             Logger.print_red_message(f"Could not measure free GPU memory ({exc}); using <batches> as given.",
                                      print_file_name=False)
-            return configured_batch_size
+            return cls._record_batch_size(configured_batch_size)
 
         # Per vertex on the default device: the error matrix over the whole grid (accumulated across
         # concatenated runs, so one copy regardless of how many runs there are) plus the transient
@@ -509,10 +517,52 @@ class GEMpRFAnalysis:
                 f"({free_bytes / 1024 ** 3:.1f} GB free on GPU {ggm.get_instance().default_gpu_id}, "
                 f"{num_model_signals} model signals).", print_file_name=False)
 
+        return cls._record_batch_size(batch_size)
+
+    # The batch size most recently handed out, so an out-of-memory retry knows what the failed
+    # allocation was sized against. The fit loops work this out internally, so there is nothing for
+    # the retry to read otherwise.
+    last_y_batch_size = None
+
+    @classmethod
+    def _record_batch_size(cls, batch_size):
+        cls.last_y_batch_size = batch_size
         return batch_size
 
     @classmethod
-    def get_pRF_estimations(cls, cfg, O_gpu, prf_space, prf_model, stimulus, prf_analysis, arr_2d_location_inv_M_cpu, measured_data_filepath, timer=None):
+    def _run_with_oom_retry(cls, run_once, input_desc, default_gpu_id, report):
+        """Run one input, shrinking its Y-batch and starting it over if the GPU runs out of memory.
+
+        ``run_once(batch_size_override)`` must rebuild all of its own state, which both call sites do
+        -- they are whole-file/whole-block functions whose accumulators are locals. Retrying
+        therefore repeats that input's work rather than resuming it, which at ~1 minute per file is
+        a fair trade against failing outright.
+
+        Only out-of-memory is retried, and only around the fit: a shortfall during model-signal
+        synthesis does not scale with the Y-batch, so shrinking it would just fail more slowly. When
+        the attempts run out the original exception propagates untouched, so the run report still
+        records the real failure.
+        """
+        override = None
+        for attempt in range(oom_retry.MAX_OOM_RETRIES + 1):
+            try:
+                return run_once(override)
+            except Exception as exc:
+                if not oom_retry.is_out_of_memory(exc) or attempt == oom_retry.MAX_OOM_RETRIES:
+                    raise
+                used_batch_size = cls.last_y_batch_size
+                if not used_batch_size:
+                    raise  # the failure was not inside a sized fit loop; nothing to shrink
+                requested_bytes, _ = oom_retry.parse_oom(exc)
+                new_override = oom_retry.next_batch_size(used_batch_size, requested_bytes, default_gpu_id)
+                if new_override is None or new_override >= used_batch_size:
+                    raise
+                oom_retry.announce(input_desc, used_batch_size, new_override, requested_bytes)
+                report.add_oom_retry(input_desc, used_batch_size, new_override)
+                override = new_override
+
+    @classmethod
+    def get_pRF_estimations(cls, cfg, O_gpu, prf_space, prf_model, stimulus, prf_analysis, arr_2d_location_inv_M_cpu, measured_data_filepath, timer=None, batch_size_override=None):
         valid_refined_prf_points_XY = None
         r2_results = None
         timer = timer if timer is not None else PhaseTimer(enabled=False)
@@ -538,7 +588,8 @@ class GEMpRFAnalysis:
             raise TimepointMismatchError(f"Number of timepoints in measured fMRI data ({Y_signals_cpu.shape[0]}) and stimulus ({stimulus_num_frames}) do not match for file: {measured_data_filepath}")
 
         total_y_signals = Y_signals_cpu.shape[1]
-        batch_size = cls.get_y_batch_size(cfg, total_y_signals, len(prf_space.multi_dim_points_cpu))
+        batch_size = cls.get_y_batch_size(cfg, total_y_signals, len(prf_space.multi_dim_points_cpu),
+                                          override=batch_size_override)
         for current_batch_idx in range(0, total_y_signals, batch_size):
             Y_signals_batch_gpu = ggm.get_instance().execute_cupy_func_on_default(cp.asarray, cupy_func_args=(Y_signals_cpu[:, current_batch_idx: current_batch_idx + batch_size],))
 
@@ -770,9 +821,14 @@ class GEMpRFAnalysis:
             start_time = time.time()
             try:
                 timer = PhaseTimer(enabled=cfg.write_debug_info)
-                block_fallback_stats = cls._process_concatenation_block(cfg, prf_model, prf_space, concatenate_block_info, task_specific_data_dict,
-                                                 arr_2d_location_inv_M_cpu, refinefit_on_gpu, default_gpu_id, YSignalsInfo,
-                                                 counter, len(required_concatenations_info), start_time, timer=timer)
+                block_fallback_stats = cls._run_with_oom_retry(
+                    lambda batch_size_override: cls._process_concatenation_block(
+                        cfg, prf_model, prf_space, concatenate_block_info, task_specific_data_dict,
+                        arr_2d_location_inv_M_cpu, refinefit_on_gpu, default_gpu_id, YSignalsInfo,
+                        counter, len(required_concatenations_info), start_time, timer=timer,
+                        batch_size_override=batch_size_override),
+                    input_desc=concatenate_block_info.concatenation_result_filepath,
+                    default_gpu_id=default_gpu_id, report=report)
                 timer.report()
                 report.add_phase_timings(timer.totals)
             except Exception as exc:
@@ -791,7 +847,8 @@ class GEMpRFAnalysis:
     @classmethod
     def _process_concatenation_block(cls, cfg, prf_model, prf_space, concatenate_block_info, task_specific_data_dict,
                                      arr_2d_location_inv_M_cpu, refinefit_on_gpu, default_gpu_id, YSignalsInfo,
-                                     counter, num_concatenation_blocks, start_time, timer=None):
+                                     counter, num_concatenation_blocks, start_time, timer=None,
+                                     batch_size_override=None):
         """Run a single concatenation block. Raises on failure; the caller records it in the run report.
 
         Returns ``(block_fallback_stats, block_fallback_records)``: the per-block grid-fallback stats
@@ -834,7 +891,8 @@ class GEMpRFAnalysis:
         ###################               
         # json_data = None   
         total_y_signals = arr_Y_signals_cpu[0].Y_signals_cpu.shape[1]
-        batch_size = cls.get_y_batch_size(cfg, total_y_signals, len(prf_space.multi_dim_points_cpu))
+        batch_size = cls.get_y_batch_size(cfg, total_y_signals, len(prf_space.multi_dim_points_cpu),
+                                          override=batch_size_override)
         for current_batch_idx in range(0, total_y_signals, batch_size):    
             # go through all datasets and compute error terms for each run
             # arr_e_cpu = None #cp.empty((num_runs, batch_size, num_signals)) #[]
@@ -1091,7 +1149,13 @@ class GEMpRFAnalysis:
 
             try:
                 timer = PhaseTimer(enabled=cfg.write_debug_info)
-                valid_refined_prf_points_XY, r2_results, grid_fallback_stats, grid_fallback_records = GEMpRFAnalysis.get_pRF_estimations(cfg, O_gpu, prf_space, prf_model, stimulus, prf_analysis, arr_2d_location_inv_M_cpu, measured_data_filepath, timer=timer)
+                valid_refined_prf_points_XY, r2_results, grid_fallback_stats, grid_fallback_records = GEMpRFAnalysis._run_with_oom_retry(
+                    lambda batch_size_override: GEMpRFAnalysis.get_pRF_estimations(
+                        cfg, O_gpu, prf_space, prf_model, stimulus, prf_analysis,
+                        arr_2d_location_inv_M_cpu, measured_data_filepath, timer=timer,
+                        batch_size_override=batch_size_override),
+                    input_desc=measured_data_filepath,
+                    default_gpu_id=ggm.get_instance().default_gpu_id, report=report)
                 # profiler.disable()
                 # stats = pstats.Stats(profiler, stream=profile_stream)
                 # stats.strip_dirs().sort_stats("cumulative").print_stats(20)  # Top 20 most time-consuming calls

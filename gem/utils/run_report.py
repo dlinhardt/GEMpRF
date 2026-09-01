@@ -30,6 +30,7 @@ class RunReport:
         self.grid_fallbacks = []  # list of (input_desc, stats_dict) for refined -> grid reverts
         self.setup_timings = {}   # phase name -> seconds, for the once-per-run work before any file
         self.phase_totals = {}    # phase name -> seconds, summed over every analysis (debug runs only)
+        self.oom_retries = []     # list of (input_desc, old_batch_size, new_batch_size)
 
     # Readable names for the setup phases, in the order they run.
     SETUP_PHASE_LABELS = (
@@ -91,6 +92,16 @@ class RunReport:
         for name, seconds in (totals or {}).items():
             self.phase_totals[name] = self.phase_totals.get(name, 0.0) + float(seconds)
 
+    def add_oom_retry(self, input_desc, old_batch_size, new_batch_size):
+        """Record that an input ran out of GPU memory and was redone at a smaller Y-batch.
+
+        Worth a section of its own rather than a log line: the batch size decides how many vertices
+        are argmaxed together and which of them revert to the grid point, so an input that retried
+        is not bit-comparable with one that did not. A silent recovery would turn a hard failure
+        into an inconsistency between subjects that nothing downstream would flag.
+        """
+        self.oom_retries.append((input_desc, int(old_batch_size), int(new_batch_size)))
+
     def add_grid_fallback(self, input_desc, stats):
         # stats: dict with keys total, on_grid, worse_error, x_too_far, y_too_far,
         #        sigma_too_far, nan_refined, zero_signal
@@ -133,6 +144,12 @@ class RunReport:
                 share = 100 * seconds / measured if measured else 0.0
                 lines.append(f"  {name:<22}: {datetime.timedelta(seconds=round(seconds))}  ({share:.0f}%)")
             lines.append(f"  {'measured total':<22}: {datetime.timedelta(seconds=round(measured))}")
+
+        if self.oom_retries:
+            title = "Out-of-memory retries (results NOT comparable with a run that did not retry)"
+            lines += ["", title, "-" * len(title)]
+            for input_desc, old_batch_size, new_batch_size in self.oom_retries:
+                lines.append(f"  Y-batch {old_batch_size} -> {new_batch_size}  {input_desc}")
 
         if self.completed:
             title = f"Completed ({self.num_completed})"
