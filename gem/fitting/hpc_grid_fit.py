@@ -14,6 +14,14 @@ import cupy as cp
 from gem.utils.gem_gpu_manager import GemGpuManager as ggm
 
 class GridFit:
+    # Target size of the transient product that is held while one column slice is written into the
+    # error matrix. The slow path used to multiply a whole model-signal chunk at once and only then
+    # add it into `out`, so its peak was `out` plus a second array of the same width. On the
+    # concatenated path, where `out` is passed in and accumulated into, that is what failed:
+    # 791 vertices x 471,015 columns x 8 bytes = the 2,980,583,424 byte allocation cons01 died on.
+    # Slicing the columns bounds the transient here instead of letting it scale with the grid.
+    ERROR_MATRIX_CHUNK_BYTES = 256 * 1024 ** 2
+
     @classmethod
     def compute_error_term(cls, Y_signals_gpu, S_prime_columnmajor_gpu):
         e_gpu = (Y_signals_gpu.T @ S_prime_columnmajor_gpu)
@@ -30,6 +38,19 @@ class GridFit:
         """
         e_gpu[cp.isinf(e_gpu) & (e_gpu > 0)] = -cp.inf
         return e_gpu
+
+    @classmethod
+    def _column_slice_width(cls, num_y_signals, num_columns):
+        """How many model-signal columns to multiply at once, from ERROR_MATRIX_CHUNK_BYTES.
+
+        Derived from the vertex count rather than fixed, so the transient stays the same size
+        whatever the batch size is: a wider Y-batch simply gets fewer columns per slice. When the
+        whole chunk already fits, this returns its full width and the loop runs exactly once, which
+        is what every configuration that fits today keeps doing.
+        """
+        bytes_per_column = max(1, int(num_y_signals) * 8)
+        width = int(cls.ERROR_MATRIX_CHUNK_BYTES // bytes_per_column)
+        return max(1, min(int(num_columns), width))
 
     @classmethod
     def _y_signals_on_device(cls, Y_signals_gpu, device_id, default_gpu_id):
@@ -49,6 +70,13 @@ class GridFit:
         already lives and only the result is brought back -- exactly as before. ``out``/``accumulate``
         let a second concatenated run add into the first run's matrix instead of allocating a second
         full copy and stacking (the stack + sum was the peak allocation of the old code path).
+
+        Each chunk is multiplied a column slice at a time (see ERROR_MATRIX_CHUNK_BYTES). Without
+        that, the peak here is ``out`` plus a transient of the same width, which is what the
+        concatenated path -- the only caller that passes ``out`` and accumulates -- ran out of
+        memory on. Slicing the columns does not change any value: every output column is a dot
+        product over the same summation index against the same operands, so the columns a call
+        happens to share affect nothing but residency.
         """
         default_gpu_id = ggm.get_instance().default_gpu_id
         num_batches = len(S_prime_cm_gpu_batches)
@@ -79,20 +107,33 @@ class GridFit:
 
             with cp.cuda.Device(device_id):
                 current_device_Y_signals = cls._y_signals_on_device(Y_signals_gpu, device_id, default_gpu_id)
-                chunk_e_result_gpu = cls._fold_positive_infinity(
-                    cls.compute_error_term(current_device_Y_signals, S_prime_cm_gpu_batches[batch_idx]))
 
-            # finally, get the "error" result back to the default device
-            with cp.cuda.Device(default_gpu_id):
-                chunk_on_default = chunk_e_result_gpu if device_id == default_gpu_id else cp.array(chunk_e_result_gpu)
-                if accumulate:
-                    out[:, column_idx : column_idx + num_signals_current_batch] += chunk_on_default
-                else:
-                    out[:, column_idx : column_idx + num_signals_current_batch] = chunk_on_default
-            # NOTE: both names have to go. For a chunk that already lives on the default device they
-            # are the same object, so dropping only one keeps a (num_y_signals, chunk_width) array --
-            # gigabytes on a dense grid -- alive while the next chunk allocates its own copy.
-            del chunk_on_default, chunk_e_result_gpu
+            # Multiply and store one column slice at a time. Every output column is an independent
+            # dot product over the same summation index, so which columns share a call changes no
+            # value -- only how much is resident at once.
+            slice_width = cls._column_slice_width(total_y_signals, num_signals_current_batch)
+            for slice_start in range(0, num_signals_current_batch, slice_width):
+                slice_stop = min(slice_start + slice_width, num_signals_current_batch)
+
+                with cp.cuda.Device(device_id):
+                    chunk_e_result_gpu = cls._fold_positive_infinity(
+                        cls.compute_error_term(current_device_Y_signals,
+                                               S_prime_cm_gpu_batches[batch_idx][:, slice_start:slice_stop]))
+
+                # finally, get the "error" result back to the default device
+                with cp.cuda.Device(default_gpu_id):
+                    chunk_on_default = chunk_e_result_gpu if device_id == default_gpu_id else cp.array(chunk_e_result_gpu)
+                    target = out[:, column_idx + slice_start : column_idx + slice_stop]
+                    if accumulate:
+                        target += chunk_on_default
+                    else:
+                        target[...] = chunk_on_default
+                # NOTE: both names have to go. For a chunk that already lives on the default device
+                # they are the same object, so dropping only one keeps the transient alive while the
+                # next slice allocates its own.
+                del chunk_on_default, chunk_e_result_gpu
+
+            del current_device_Y_signals
 
             # Note: update index
             column_idx = column_idx + num_signals_current_batch
