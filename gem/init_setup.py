@@ -175,7 +175,11 @@ def run_selected_program(selected_program, config_filepath):
     Logger.print_timing_message(f"keep_validated_sampling_points: {datetime.datetime.now() - _t0}")
 
     # NOTE
-    _ = GemWriteToFile(result_dir = result_dir, debugging_enabled=cfg.write_debug_info) # initialize the GemWriteToFile singleton instance
+    # The run tag keeps concurrent runs' debug files apart: several configs are routinely pointed at
+    # one results_anaylsis_id, and a shared debug file means an HDF5 lock collision that used to
+    # abort one of them during setup.
+    run_tag = os.path.splitext(os.path.basename(config_filepath))[0] if config_filepath else None
+    _ = GemWriteToFile(result_dir = result_dir, debugging_enabled=cfg.write_debug_info, run_tag=run_tag) # initialize the GemWriteToFile singleton instance
     GemWriteToFile.get_instance().write_array_to_h5(prf_space.multi_dim_points_cpu, variable_path=['model', 'prf_grid'], append_to_existing_variable=False)
 
     # run the pRF analysis

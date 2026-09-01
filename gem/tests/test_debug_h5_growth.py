@@ -20,6 +20,7 @@ of the behaviour under test touches CuPy.
 """
 import importlib
 import os
+import re
 import sys
 import types
 
@@ -67,13 +68,19 @@ _RUN_DATASETS = [
 ]
 
 
-def _one_run(writer_module, result_dir, scale=1):
-    """Simulate a run: a fresh writer instance, then every dataset written once."""
+def _one_run(writer_module, result_dir, scale=1, run_tag="cfg"):
+    """Simulate a run: a fresh writer instance, then every dataset written once.
+
+    The filename carries a start timestamp, so the path is read back from the writer rather than
+    rebuilt here. Runs inside one test land in the same second and therefore reuse a filename, which
+    is the case the truncate-on-first-write is there for.
+    """
     writer_module.GemWriteToFile._instance = None
-    writer = writer_module.GemWriteToFile(result_dir=result_dir, debugging_enabled=True)
+    writer = writer_module.GemWriteToFile(result_dir=result_dir, debugging_enabled=True,
+                                          run_tag=run_tag)
     for path, kilobytes in _RUN_DATASETS:
         writer.write_array_to_h5(np.zeros(kilobytes * scale * 1000 // 8), variable_path=path)
-    return os.path.join(result_dir, "debug_model_data.h5")
+    return writer.debug_filepath()
 
 
 def test_file_does_not_grow_across_runs(writer_module, tmp_path):
@@ -130,7 +137,7 @@ def test_content_survives_the_truncation(writer_module, tmp_path):
     writer.write_array_to_h5(np.arange(20.0), variable_path=["model", "second"])
     writer.write_array_to_h5(np.arange(30.0), variable_path=["model", "third"])
 
-    with h5py.File(os.path.join(str(tmp_path), "debug_model_data.h5"), "r") as f:
+    with h5py.File(writer.debug_filepath(), "r") as f:
         assert np.array_equal(f["model/first"][:], np.arange(10.0))
         assert np.array_equal(f["model/second"][:], np.arange(20.0))
         assert np.array_equal(f["model/third"][:], np.arange(30.0))
@@ -143,7 +150,7 @@ def test_rewriting_the_same_path_within_a_run_keeps_the_last_value(writer_module
     writer.write_array_to_h5(np.zeros(50), variable_path=["model", "signals"])
     writer.write_array_to_h5(np.ones(70), variable_path=["model", "signals"])
 
-    with h5py.File(os.path.join(str(tmp_path), "debug_model_data.h5"), "r") as f:
+    with h5py.File(writer.debug_filepath(), "r") as f:
         assert np.array_equal(f["model/signals"][:], np.ones(70))
 
 
@@ -151,4 +158,76 @@ def test_nothing_is_written_when_debugging_is_disabled(writer_module, tmp_path):
     writer_module.GemWriteToFile._instance = None
     writer = writer_module.GemWriteToFile(result_dir=str(tmp_path), debugging_enabled=False)
     writer.write_array_to_h5(np.zeros(10), variable_path=["model", "signals"])
-    assert not os.path.exists(os.path.join(str(tmp_path), "debug_model_data.h5"))
+    assert not os.path.exists(writer.debug_filepath())
+
+
+# --------------------------------------------------------------------------------------
+# Concurrent runs. Two configs pointed at one results_anaylsis_id shared a single
+# debug_model_data.h5; HDF5 locks it exclusively for writing, so launching both at once killed one
+# of them mid-setup with BlockingIOError. The analysis had not failed -- its diagnostic side-channel
+# had.
+# --------------------------------------------------------------------------------------
+
+def test_different_configs_in_one_directory_get_different_files(writer_module, tmp_path):
+    """The collision that crashed the run: same result_dir, different configs."""
+    first = _one_run(writer_module, str(tmp_path), run_tag="config-roadmap01")
+    second = _one_run(writer_module, str(tmp_path), run_tag="config-cons01")
+
+    assert first != second, "both configs still write the same file"
+    assert os.path.exists(first) and os.path.exists(second)
+
+
+def test_the_filename_carries_the_config_and_a_timestamp(writer_module, tmp_path):
+    writer_module.GemWriteToFile._instance = None
+    writer = writer_module.GemWriteToFile(result_dir=str(tmp_path), debugging_enabled=True,
+                                          run_tag="config-cons01")
+    name = os.path.basename(writer.debug_filepath())
+    assert name.startswith("debug_model_data_config-cons01_")
+    assert re.fullmatch(r"debug_model_data_config-cons01_\d{8}-\d{6}\.h5", name), name
+
+
+def test_the_filename_is_stable_across_writes(writer_module, tmp_path):
+    """The timestamp is stamped at init. Reading the clock per write would scatter the datasets."""
+    writer_module.GemWriteToFile._instance = None
+    writer = writer_module.GemWriteToFile(result_dir=str(tmp_path), debugging_enabled=True,
+                                          run_tag="cfg")
+    before = writer.debug_filepath()
+    writer.write_array_to_h5(np.zeros(10), variable_path=["model", "a"])
+    writer.write_array_to_h5(np.zeros(10), variable_path=["model", "b"])
+    assert writer.debug_filepath() == before
+    assert len([p for p in os.listdir(str(tmp_path)) if p.endswith(".h5")]) == 1
+
+
+def test_a_failing_write_disables_debug_output_instead_of_raising(writer_module, tmp_path,
+                                                                 monkeypatch):
+    """The whole point: a locked debug file must not take a 15-minute analysis down with it."""
+    writer_module.GemWriteToFile._instance = None
+    writer = writer_module.GemWriteToFile(result_dir=str(tmp_path), debugging_enabled=True,
+                                          run_tag="cfg")
+
+    def _locked(*args, **kwargs):
+        raise BlockingIOError(11, "unable to lock file")
+
+    monkeypatch.setattr(writer_module.h5py, "File", _locked)
+
+    writer.write_array_to_h5(np.zeros(10), variable_path=["model", "a"])   # must not raise
+    writer.write_array_to_h5(np.zeros(10), variable_path=["model", "b"])   # nor this one
+
+    # and once it has failed it stops trying, so the warning is printed once rather than per dataset
+    monkeypatch.undo()
+    writer.write_array_to_h5(np.zeros(10), variable_path=["model", "c"])
+    assert not os.path.exists(writer.debug_filepath())
+
+
+def test_the_lock_failure_message_says_what_to_do(writer_module, tmp_path, monkeypatch, capsys):
+    writer_module.GemWriteToFile._instance = None
+    writer = writer_module.GemWriteToFile(result_dir=str(tmp_path), debugging_enabled=True,
+                                          run_tag="cfg")
+    monkeypatch.setattr(writer_module.h5py, "File",
+                        lambda *a, **k: (_ for _ in ()).throw(BlockingIOError(11, "unable to lock file")))
+    writer.write_array_to_h5(np.zeros(10), variable_path=["model", "a"])
+
+    printed = capsys.readouterr().out
+    assert "results_anaylsis_id" in printed
+    assert "write_debug_info" in printed
+    assert "analysis continues" in printed

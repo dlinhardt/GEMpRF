@@ -8,44 +8,104 @@
 "@Desc    :   None",     
 """
 
+import datetime
 import os
 import h5py
 import numpy as np
 import cupy as cp
 
+from gem.utils.logger import Logger
+
 
 class GemWriteToFile:
     _instance = None  # Singleton instance
 
-    def __new__(cls, result_dir, debugging_enabled=False):
+    def __new__(cls, result_dir, debugging_enabled=False, run_tag=None):
         if cls._instance is None:
             cls._instance = super(GemWriteToFile, cls).__new__(cls)
-            cls._instance.__initialize(result_dir, debugging_enabled)
-        elif cls._instance.__result_dir != result_dir or cls._instance.__debugging_enabled != debugging_enabled: # Re-initialize if parameters differ
-            cls._instance.__initialize(result_dir, debugging_enabled)
+            cls._instance.__initialize(result_dir, debugging_enabled, run_tag)
+        elif (cls._instance.__result_dir != result_dir
+              or cls._instance.__debugging_enabled != debugging_enabled
+              or cls._instance.__run_tag != run_tag): # Re-initialize if parameters differ
+            cls._instance.__initialize(result_dir, debugging_enabled, run_tag)
         return cls._instance
 
-    def __initialize(self, result_dir, debugging_enabled):
+    def __initialize(self, result_dir, debugging_enabled, run_tag=None):
         self.__result_dir = result_dir
         self.__debugging_enabled = debugging_enabled
+        self.__run_tag = run_tag
+        # Stamped once here, not per write -- reading the clock inside write_array_to_h5() would put
+        # every dataset in a file of its own.
+        self.__started_at = datetime.datetime.now()
         # The first write of a run truncates the debug file instead of adding to whatever the
         # previous run left there -- see __create_dataset for why appending to it is not free.
         self.__debug_file_started = False
+
+    def __debug_filepath(self):
+        """Where this run's debug data goes: one file per run, named like the run report.
+
+        Several configs are routinely pointed at one ``results_anaylsis_id``, and the file used to be
+        a single fixed name at the root of it. HDF5 takes an exclusive lock whenever it opens for
+        write, so two such runs launched together killed each other with
+        `BlockingIOError: unable to lock file` during setup -- and even with the lock holding, one
+        run truncating between another's writes would leave two runs' datasets interleaved in one
+        file.
+
+        The config tag plus a start timestamp makes every run's file its own, so concurrent runs
+        cannot interfere at all. NOTE that this means the files accumulate rather than being
+        overwritten -- roughly 26 GiB per debug-enabled run at a 301x301 stimulus -- so they are
+        worth clearing out periodically. `gem_run_report_<timestamp>.txt` is named the same way and
+        sits beside them.
+        """
+        stamp = f"{self.__started_at:%Y%m%d-%H%M%S}"
+        tag = f"{self.__run_tag}_" if self.__run_tag else ""
+        return os.path.join(self.__result_dir, f"debug_model_data_{tag}{stamp}.h5")
+
+    def __disable_after_failure(self, exc):
+        """Report a debug-write failure once and stop trying, without failing the run.
+
+        This file is diagnostic output. Losing an analysis that has already spent minutes in setup
+        because an optional side-channel could not be opened is never the right trade, so every
+        failure here is terminal for debug output and harmless for everything else.
+        """
+        hint = ""
+        if isinstance(exc, (BlockingIOError, OSError)) and "lock" in str(exc).lower():
+            hint = ("\n  Another run is most likely writing debug output into the same results "
+                    "directory. Give each config its own <results_anaylsis_id>, or set "
+                    "write_debug_info=\"false\".")
+        Logger.print_red_message(
+            f"Could not write debug output ({type(exc).__name__}: {exc}). "
+            f"Debug output is now disabled for this run; the analysis continues.{hint}",
+            print_file_name=False)
+        self.__debugging_enabled = False
 
     @classmethod
     def get_instance(cls):
         return cls._instance
 
+    def debug_filepath(self):
+        """The file this run's debug output goes to, whether or not anything has been written."""
+        return self.__debug_filepath()
+
     def write_array_to_h5(self, data, variable_path, append_to_existing_variable=False):
         """
         Write a NumPy/CuPy array or list of arrays into an HDF5 file with hierarchical groups.
-        If variable_path corresponds to 'model_signals' or 'derivative_model_signals_*', 
+        If variable_path corresponds to 'model_signals' or 'derivative_model_signals_*',
         concatenates list of arrays along axis=0 before writing.
+
+        Never raises: this is diagnostic output, and a failure here disables further debug writing
+        rather than taking the analysis down with it (see __disable_after_failure).
         """
         if not self.__debugging_enabled:
             return
 
-        filepath = os.path.join(self.__result_dir, "debug_model_data.h5")
+        try:
+            self.__write_array_to_h5(data, variable_path, append_to_existing_variable)
+        except Exception as exc:
+            self.__disable_after_failure(exc)
+
+    def __write_array_to_h5(self, data, variable_path, append_to_existing_variable=False):
+        filepath = self.__debug_filepath()
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
         # Convert variable_path to a slash-separated string
